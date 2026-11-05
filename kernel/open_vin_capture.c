@@ -357,6 +357,8 @@ struct ovc_dev {
 	struct v4l2_pix_format fmt;
 	/* Size of the reserved-memory pool, for the queue_setup buffer cap. */
 	resource_size_t carveout_size;
+	/* The pool is a reusable CMA area, not a declared coherent region. */
+	bool carveout_cma;
 };
 
 static inline struct ovc_buffer *to_ovc_buffer(struct vb2_v4l2_buffer *vbuf)
@@ -1050,6 +1052,27 @@ static irqreturn_t ovc_isr(int irq, void *priv)
 /* vb2 queue ops                                                            */
 /* ------------------------------------------------------------------------ */
 
+/*
+ * Pool space one buffer of @size really takes, for the cap below.
+ * A declared coherent region is a bitmap allocator that rounds every
+ * buffer up to a power of two (#98). A reusable CMA area places each
+ * buffer on min(order, CONFIG_CMA_ALIGNMENT) alignment instead, so
+ * buffers pack at their size rounded to that alignment: a 16.88 MiB
+ * 4096x2160 frame costs 17 MiB there, not 32.
+ */
+static unsigned long ovc_buffer_cost(const struct ovc_dev *ovc,
+				     unsigned long size)
+{
+	unsigned int order = get_order(size);
+
+	if (!ovc->carveout_cma)
+		return PAGE_SIZE << order;
+#ifdef CONFIG_CMA_ALIGNMENT
+	order = min_t(unsigned int, order, CONFIG_CMA_ALIGNMENT);
+#endif
+	return ALIGN(PAGE_ALIGN(size), PAGE_SIZE << order);
+}
+
 static int ovc_queue_setup(struct vb2_queue *vq, unsigned int *nbuffers,
 			   unsigned int *nplanes, unsigned int sizes[],
 			   struct device *alloc_devs[])
@@ -1081,7 +1104,7 @@ static int ovc_queue_setup(struct vb2_queue *vq, unsigned int *nbuffers,
 	 * any geometry at all, not a comfort margin.
 	 */
 	if (ovc->carveout_size) {
-		unsigned long cost = PAGE_SIZE << get_order(ovc->fmt.sizeimage);
+		unsigned long cost = ovc_buffer_cost(ovc, ovc->fmt.sizeimage);
 		unsigned int max = div_u64(ovc->carveout_size, cost);
 
 		if (max < OVC_MIN_BUFFERS) {
@@ -1683,9 +1706,11 @@ static int ovc_probe(struct platform_device *pdev)
 
 		if (rmem)
 			ovc->carveout_size = rmem->size;
+		ovc->carveout_cma = of_property_read_bool(rmem_np, "reusable");
 		of_node_put(rmem_np);
 	}
-	dev_info(dev, "capture carveout %pa bytes\n", &ovc->carveout_size);
+	dev_info(dev, "capture %s %pa bytes\n",
+		 ovc->carveout_cma ? "reusable CMA" : "carveout", &ovc->carveout_size);
 
 	/*
 	 * The VI/ISP domain gates, before the first register access. Nothing

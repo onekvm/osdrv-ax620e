@@ -18,7 +18,7 @@ NanoKVM Pro（AX630C）与 NanoKVM Go（AX620Q）的自有视频驱动，作为�
 
 Pro 的采集池（96 MiB）与编码帧缓冲区（96 MiB）各是对应设备的专属 CMA 区。没有视频流持有缓冲时，Linux 可在其中放可迁移页面；开流时驱动经 DMA API 分配，内核先把这些页面迁出。
 
-- VIN：`dma_alloc_coherent()` 从设备 CMA 区分配，驱动无需区分两种布局。
+- VIN：`dma_alloc_coherent()` 从设备 CMA 区分配。缓冲数上限按实际占用估算：`no-map` 区每块按 2 的幂取整，CMA 区按 `CONFIG_CMA_ALIGNMENT`（1 MiB）取整，4096×2160 每块 17 MiB，96 MiB 可放 5 块（原按 32 MiB 估只放 3 块）。
 - VC8000E：区域为 `reusable` 时每次 `HANTRO_IOCH_ALLOC_FRAMEBUF` 调用 `dma_alloc_pages()`，释放即归还；仍为 `no-map` 时沿用固定区间内的地址分配。用户态 ABI 不变。
 - 是否改写由 `onekvm-distro` 机型变量 `ONEKVM_PRO_MEDIA_REUSABLE` 决定（默认 `1`），不改内核 dts。
 
