@@ -1,4 +1,4 @@
-- 模块只经 `onekvm-distro` 的 OpenEmbedded 构建：`ONEKVM_DEBUG_WORKTREES=onekvm-ax620e-media make ONEKVM_MACHINE=onekvm-nanokvm-pro build package onekvm-ax620e-media-modules`（Go 换 `ONEKVM_MACHINE=onekvm-nanokvm-go`）。禁止树外交叉编译。
+- 模块只经 `onekvm-distro` 的 OpenEmbedded 构建：`ONEKVM_DEBUG_WORKTREES=osdrv-ax620e make ONEKVM_MACHINE=onekvm-nanokvm-pro build package onekvm-ax620e-media-modules`（Go 换 `ONEKVM_MACHINE=onekvm-nanokvm-go`）。禁止树外交叉编译。
 - 模块包名保持 `kernel-module-<模块名>`，后端 `onekvm-video-ax630c` 按此依赖；改模块名需同步后端配方。
 - Pro 设备树内存布局由 `tools/ax620e_media_dtb.py` 在 `onekvm-distro` 打包启动镜像时改写，不改内核 dts；改工具或驱动的内存模型同时补 `tests/`（`make -C tests test`），正式发布递增系统版本 `y`。
 - `kernel/vc8000e/eswin/` 是供应商源码，保持原样以便重新同步。

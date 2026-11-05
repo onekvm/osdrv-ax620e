@@ -1,4 +1,4 @@
-# onekvm-ax620e-media
+# osdrv-ax620e
 
 NanoKVM Pro（AX630C）与 NanoKVM Go（AX620Q）的自有视频驱动，作为树外内核模块构建。
 
