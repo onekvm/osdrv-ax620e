@@ -1,0 +1,4 @@
+- 模块只经 `onekvm-distro` 的 OpenEmbedded 构建：`ONEKVM_DEBUG_WORKTREES=onekvm-ax620e-media make ONEKVM_MACHINE=onekvm-nanokvm-pro build package onekvm-ax620e-media-modules`（Go 换 `ONEKVM_MACHINE=onekvm-nanokvm-go`）。禁止树外交叉编译。
+- 模块包名保持 `kernel-module-<模块名>`，后端 `onekvm-video-ax630c` 按此依赖；改模块名需同步后端配方。
+- `kernel/vc8000e/eswin/` 是供应商源码，保持原样以便重新同步。
+- 测试设备：Pro 用 105，Go 用 140。未经同意禁止 `git push`。流水账写 `local-docs/`（gitignore）。

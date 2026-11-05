@@ -13,7 +13,7 @@ ccflags-y += -I$(src)/eswin
 # deliberately kept unmodified so it can be re-synced from upstream eswin.
 ccflags-y += -Wno-unused-variable -Wno-unused-function
 
-obj-$(CONFIG_VIDEO_AX630C_VC8000E) += ax630c_venc_vcmd.o
+obj-m += ax630c_venc_vcmd.o
 ax630c_venc_vcmd-y := ax630c_vcmd_glue.o \
 		      framebuf_alloc.o \
 		      eswin/vc8000_vcmd_driver.o \

@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Out-of-tree build: make -C <kernel build> M=<this dir> modules
+# Kernel options the modules need are listed in README.md.
+obj-m += open_vin_csi2.o
+obj-m += open_vin_capture.o
+obj-m += ax630c_tdp.o
+obj-m += vc8000e/
