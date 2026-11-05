@@ -132,6 +132,7 @@ static int ax630c_vcmd_probe(struct platform_device *pdev)
 	struct ax630c_vcmd *vc;
 	struct device_node *rmem_np;
 	struct reserved_mem *rmem;
+	bool fb_cma;
 	struct resource *res;
 	int idx, irq, ret;
 
@@ -169,8 +170,9 @@ static int ax630c_vcmd_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret, "cmdbuf memory-region\n");
 
 	/*
-	 * "framebuf": encoder frame buffers. The kernel never maps it, so it
-	 * is a plain no-map region and framebuf_alloc.c does the bookkeeping.
+	 * "framebuf": encoder frame buffers. A no-map region is carved by
+	 * framebuf_alloc.c; a reusable shared-dma-pool becomes this device's
+	 * CMA area, lent to Linux while no stream holds frame buffers.
 	 */
 	idx = of_property_match_string(dev->of_node, "memory-region-names",
 				       "framebuf");
@@ -184,14 +186,23 @@ static int ax630c_vcmd_probe(struct platform_device *pdev)
 		goto err_rmem;
 	}
 	rmem = of_reserved_mem_lookup(rmem_np);
+	fb_cma = of_property_read_bool(rmem_np, "reusable");
 	of_node_put(rmem_np);
 	if (!rmem) {
 		ret = -EINVAL;
 		dev_err(dev, "framebuf region is not reserved memory\n");
 		goto err_rmem;
 	}
-	vcmd_fb_set_region(rmem->base, rmem->size);
-	dev_info(dev, "framebuf carveout %pa + %pa\n", &rmem->base, &rmem->size);
+	if (fb_cma) {
+		ret = of_reserved_mem_device_init_by_idx(dev, dev->of_node, idx);
+		if (ret) {
+			dev_err_probe(dev, ret, "framebuf CMA area\n");
+			goto err_rmem;
+		}
+	}
+	vcmd_fb_set_region(rmem->base, rmem->size, fb_cma);
+	dev_info(dev, "framebuf %s %pa + %pa\n", fb_cma ? "reusable CMA" : "carveout",
+		 &rmem->base, &rmem->size);
 
 	vc->clk = devm_clk_get(dev, NULL);
 	if (IS_ERR(vc->clk)) {

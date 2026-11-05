@@ -10,10 +10,14 @@
  * (91MB with the prover input region, 59MB without; 1080p is 23MB).
  * docs/vcmd-cma-unblock.md.
  *
- * The kernel never maps this memory: only the encoder DMAs it and userspace
- * mmaps it (write-combining) through the char device, so the reserved-memory
- * node is a plain `no-map` region rather than a dma pool, and this file is
- * pure address-space bookkeeping.
+ * Two backings, chosen by the reserved-memory node:
+ *  - `no-map` carveout: the kernel never maps it; only the encoder DMAs it
+ *    and userspace mmaps it (write-combining) through the char device, so
+ *    this file is pure address-space bookkeeping over [base, base + size).
+ *  - `reusable` shared-dma-pool: the node is the device's own CMA area.
+ *    Each allocation is dma_alloc_pages() from it, so Linux uses the pages
+ *    for movable memory while no stream holds them. The region size still
+ *    caps a single allocation.
  */
 #include <linux/kernel.h>
 #include <linux/mm.h>
@@ -25,6 +29,7 @@
 #include <linux/device.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-direction.h>
+#include <linux/dma-mapping.h>
 #include <linux/scatterlist.h>
 #include <linux/err.h>
 
@@ -32,11 +37,14 @@
 
 static unsigned long framebuf_base;
 static unsigned long framebuf_size;
+static bool framebuf_cma;
+static struct device *fb_dev;
 
-void vcmd_fb_set_region(unsigned long base, unsigned long size)
+void vcmd_fb_set_region(unsigned long base, unsigned long size, bool cma)
 {
 	framebuf_base = base;
 	framebuf_size = size;
+	framebuf_cma = cma;
 }
 
 struct fb_alloc {
@@ -44,10 +52,57 @@ struct fb_alloc {
 	unsigned long bus;
 	unsigned long size;
 	struct file *owner;
+	struct page *page;       /* CMA backing only */
 };
 
 static LIST_HEAD(fb_list);
 static DEFINE_MUTEX(fb_lock);
+
+static void fb_free(struct fb_alloc *a)
+{
+	if (a->page) {
+		/* Drop CPU cache lines of the linear alias before Linux reuses
+		 * the pages; userspace and the encoder bypassed them. */
+		dma_sync_single_for_cpu(fb_dev, a->bus, a->size,
+					DMA_BIDIRECTIONAL);
+		dma_free_pages(fb_dev, a->size, a->page, a->bus,
+			       DMA_BIDIRECTIONAL);
+	}
+	kfree(a);
+}
+
+/* Insert sorted by bus: before the first entry above it. */
+static void fb_insert(struct fb_alloc *n)
+{
+	struct fb_alloc *a;
+
+	list_for_each_entry(a, &fb_list, node)
+		if (a->bus > n->bus)
+			break;
+	list_add_tail(&n->node, &a->node); /* works for head too (entry==head) */
+}
+
+static int fb_alloc_cma(struct fb_alloc *n)
+{
+	dma_addr_t dma;
+
+	if (!fb_dev)
+		return -ENODEV;
+	/* May migrate movable pages out of the area; do not hold fb_lock. */
+	n->page = dma_alloc_pages(fb_dev, n->size, &dma, DMA_BIDIRECTIONAL,
+				  GFP_KERNEL | __GFP_NOWARN);
+	if (!n->page)
+		return -ENOMEM;
+	/* dma_alloc_pages() zeroed through the cacheable linear map; write
+	 * that back before userspace (write-combining) and the encoder use
+	 * the buffer. */
+	dma_sync_single_for_device(fb_dev, dma, n->size, DMA_BIDIRECTIONAL);
+	n->bus = dma;
+	mutex_lock(&fb_lock);
+	fb_insert(n);
+	mutex_unlock(&fb_lock);
+	return 0;
+}
 
 int vcmd_fb_alloc(struct file *filp, unsigned long size, unsigned long *bus)
 {
@@ -64,6 +119,17 @@ int vcmd_fb_alloc(struct file *filp, unsigned long size, unsigned long *bus)
 	n->size = size;
 	n->owner = filp;
 
+	if (framebuf_cma) {
+		int ret = fb_alloc_cma(n);
+
+		if (ret) {
+			kfree(n);
+			return ret;
+		}
+		*bus = n->bus;
+		return 0;
+	}
+
 	mutex_lock(&fb_lock);
 	hole = framebuf_base;
 	list_for_each_entry(a, &fb_list, node) {
@@ -77,11 +143,7 @@ int vcmd_fb_alloc(struct file *filp, unsigned long size, unsigned long *bus)
 		return -ENOMEM;
 	}
 	n->bus = hole;
-	/* insert sorted: before the first entry above the hole */
-	list_for_each_entry(a, &fb_list, node)
-		if (a->bus > hole)
-			break;
-	list_add_tail(&n->node, &a->node); /* works for head too (entry==head) */
+	fb_insert(n);
 	mutex_unlock(&fb_lock);
 
 	*bus = n->bus;
@@ -90,7 +152,7 @@ int vcmd_fb_alloc(struct file *filp, unsigned long size, unsigned long *bus)
 
 int vcmd_fb_free(struct file *filp, unsigned long bus)
 {
-	struct fb_alloc *a;
+	struct fb_alloc *a, *found = NULL;
 	int ret = -ENOENT;
 
 	mutex_lock(&fb_lock);
@@ -101,12 +163,14 @@ int vcmd_fb_free(struct file *filp, unsigned long bus)
 				break;
 			}
 			list_del(&a->node);
-			kfree(a);
+			found = a;
 			ret = 0;
 			break;
 		}
 	}
 	mutex_unlock(&fb_lock);
+	if (found)
+		fb_free(found);
 	return ret;
 }
 
@@ -115,15 +179,17 @@ static void vcmd_imp_release_filp(struct file *filp);
 void vcmd_fb_release_filp(struct file *filp)
 {
 	struct fb_alloc *a, *tmp;
+	LIST_HEAD(mine);
 
 	mutex_lock(&fb_lock);
-	list_for_each_entry_safe(a, tmp, &fb_list, node) {
-		if (a->owner == filp) {
-			list_del(&a->node);
-			kfree(a);
-		}
-	}
+	list_for_each_entry_safe(a, tmp, &fb_list, node)
+		if (a->owner == filp)
+			list_move_tail(&a->node, &mine);
 	mutex_unlock(&fb_lock);
+	list_for_each_entry_safe(a, tmp, &mine, node) {
+		list_del(&a->node);
+		fb_free(a);
+	}
 	vcmd_imp_release_filp(filp);
 }
 
@@ -159,7 +225,6 @@ struct fb_import {
 };
 
 static LIST_HEAD(imp_list);            /* guarded by fb_lock */
-static struct device *fb_dev;
 
 void vcmd_fb_set_dev(struct device *dev)
 {

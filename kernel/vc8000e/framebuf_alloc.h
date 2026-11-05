@@ -2,11 +2,11 @@
 /*
  * From-source frame-buffer allocator for the AX630C VC8000E VCMD driver (#45).
  *
- * Manages a physically-contiguous CMM carveout (outside kernel-managed DRAM)
- * and hands userspace bus addresses for encoder frame buffers, replacing the
- * fixed-address /dev/mem placement of Stage B. The kernel never maps the
- * memory: only the encoder DMAs it and userspace mmaps it (writecombine)
- * through the driver, so the allocator is pure address-space bookkeeping.
+ * Hands userspace bus addresses of physically contiguous encoder frame
+ * buffers, replacing the fixed-address /dev/mem placement of Stage B. The
+ * buffers come from a no-map carveout (address bookkeeping) or from the
+ * device's reusable CMA area (dma_alloc_pages per allocation); userspace
+ * mmaps them write-combining through the driver either way.
  *
  * ABI (added to the Hantro ioctl surface; 36/37 are unused upstream):
  *   HANTRO_IOCH_ALLOC_FRAMEBUF  in: size          out: bus_addr
@@ -55,8 +55,9 @@ int vcmd_fb_free(struct file *filp, unsigned long bus);
 void vcmd_fb_release_filp(struct file *filp);
 /* the device dma-buf attachments are made on behalf of (the venc pdev) */
 void vcmd_fb_set_dev(struct device *dev);
-/* the reserved-memory carveout this allocator hands out, from DT (#83) */
-void vcmd_fb_set_region(unsigned long base, unsigned long size);
+/* the reserved-memory region from DT (#83); cma: it is the device's
+ * reusable CMA area, allocate from it instead of carving addresses */
+void vcmd_fb_set_region(unsigned long base, unsigned long size, bool cma);
 int vcmd_dmabuf_import(struct file *filp, int fd, unsigned long *bus,
 		       unsigned long *size);
 int vcmd_dmabuf_release(struct file *filp, unsigned long bus);
