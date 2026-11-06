@@ -5,3 +5,6 @@ obj-m += open_vin_csi2.o
 obj-m += open_vin_capture.o
 obj-m += ax630c_tdp.o
 obj-m += vc8000e/
+ifeq ($(ONEKVM_LAZY_DMA),1)
+subdir-ccflags-y += -DONEKVM_LAZY_DMA -I$(ONEKVM_LAZY_DMA_INCLUDE)
+endif

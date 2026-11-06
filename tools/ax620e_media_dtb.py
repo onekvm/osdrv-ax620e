@@ -315,14 +315,80 @@ def lend_pools(fdt: Fdt) -> list[tuple[str, Region]]:
     return [(node.name, region) for node, region in targets]
 
 
+def lazy_pool(fdt: Fdt, pool_mib: int) -> list[tuple[str, Region]]:
+    """Replace both private media regions with one optional shared pool.
+
+    Validate on a copy so a rejected layout never leaves partial mutations.
+    The default CMA and the fixed VCMD command region remain untouched.
+    """
+    if pool_mib < 0 or pool_mib % 4:
+        raise DtbError("lazy pool must be a nonnegative multiple of 4 MiB")
+    out = parse(serialize(fdt))
+    if any("onekvm,lazy-dma" in n.compatible() for n in walk(out.root)):
+        raise DtbError("input already has a lazy DMA device")
+    lent = dict(lend_pools(out))
+    root = out.root
+    resmem = root.child("reserved-memory")
+    devices = [next(n for n in walk(root) if compat in n.compatible()
+                    and n.prop("status") in (None, b"okay\0", b"ok\0"))
+               for compat, _ in POOLS]
+    vin, venc = devices
+    capture = region_node(root, resmem, vin, None)
+    framebuf = region_node(root, resmem, venc, "framebuf")
+    removed_refs = {n.prop("phandle") or n.prop("linux,phandle")
+                    for n in (capture, framebuf)}
+    for node in walk(root):
+        refs = node.prop("memory-region") or b""
+        if node not in devices and any(refs[i:i + 4] in removed_refs
+                                      for i in range(0, len(refs), 4)):
+            raise DtbError(f"{node.name}: another device references a private media pool")
+    old = lent[framebuf.name]
+    if pool_mib * MIB > old.size:
+        raise DtbError("lazy pool exceeds the former encoder frame-buffer region")
+    phandle = max_phandle(root) + 1
+    supplier = Node("onekvm-lazy-dma", [
+        ("compatible", b"onekvm,lazy-dma\0"),
+        ("phandle", struct.pack(">I", phandle)),
+    ])
+    vin.props = [(k, v) for k, v in vin.props
+                 if k not in ("memory-region", "memory-region-names")]
+    names = [s for s in venc.prop("memory-region-names").split(b"\0") if s]
+    refs = struct.unpack(f">{len(names)}I", venc.prop("memory-region"))
+    keep = [(name, ref) for name, ref in zip(names, refs) if name != b"framebuf"]
+    venc.set("memory-region-names", b"".join(name + b"\0" for name, _ in keep))
+    venc.set("memory-region", struct.pack(f">{len(keep)}I", *(ref for _, ref in keep)))
+    for device in devices:
+        device.set("onekvm,lazy-dma", struct.pack(">I", phandle))
+    resmem.children = [n for n in resmem.children if n not in (capture, framebuf)]
+    regions = []
+    if pool_mib:
+        region = Region(old.start, old.start + pool_mib * MIB)
+        pool_phandle = phandle + 1
+        pool = Node(f"onekvm-lazy-dma@{region.start:x}", [
+            ("compatible", b"shared-dma-pool\0"), ("reusable", b""),
+            ("reg", encode_reg(region, cells(resmem, "#address-cells", 2),
+                               cells(resmem, "#size-cells", 2))),
+            ("phandle", struct.pack(">I", pool_phandle)),
+        ])
+        resmem.children.append(pool)
+        supplier.set("memory-region", struct.pack(">I", pool_phandle))
+        regions.append((pool.name, region))
+    root.children.append(supplier)
+    fdt.root = root
+    return regions
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--lazy-pool-mib", type=int,
+                        help="use shared lazy DMA instead of private pools (0: ordinary memory only)")
     args = parser.parse_args(argv)
     try:
         fdt = parse(args.input.read_bytes())
-        lent = lend_pools(fdt)
+        lent = (lend_pools(fdt) if args.lazy_pool_mib is None
+                else lazy_pool(fdt, args.lazy_pool_mib))
         blob = serialize(fdt)
         parse(blob)
     except DtbError as err:

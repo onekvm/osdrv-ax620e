@@ -59,6 +59,51 @@ def flags(node):
 
 
 class LendPoolsTest(unittest.TestCase):
+    def test_lazy_dma_replaces_private_pools_and_preserves_command_memory(self):
+        fdt = pro_fdt()
+        tool.lazy_pool(fdt, 64)
+        out = tool.parse(tool.serialize(fdt))
+        resmem = out.root.child("reserved-memory")
+        self.assertIsNone(resmem.child("capture-pool@79800000"))
+        self.assertIsNone(resmem.child("venc-framebuf@73800000"))
+        pool = resmem.child("onekvm-lazy-dma@73800000")
+        self.assertEqual(tool.read_regs(pool, 2, 2),
+                         [Region(0x73800000, 0x77800000)])
+        self.assertIsNotNone(pool.prop("reusable"))
+        cmd = resmem.child("venc-cmdbuf@7f800000")
+        self.assertIsNotNone(cmd.prop("no-map"))
+        vin = out.root.child("soc").child("video-capture@2400000")
+        venc = out.root.child("soc").child("venc@4010000")
+        supplier = out.root.child("onekvm-lazy-dma")
+        self.assertEqual(vin.prop("onekvm,lazy-dma"), supplier.prop("phandle"))
+        self.assertEqual(venc.prop("onekvm,lazy-dma"), supplier.prop("phandle"))
+        self.assertIsNone(vin.prop("memory-region"))
+        self.assertEqual(venc.prop("memory-region"), cmd.prop("phandle"))
+        self.assertEqual(venc.prop("memory-region-names"), b"cmdbuf\0")
+        self.assertEqual(supplier.prop("memory-region"), pool.prop("phandle"))
+
+    def test_lazy_dma_without_cma(self):
+        fdt = pro_fdt()
+        tool.lazy_pool(fdt, 0)
+        self.assertIsNone(fdt.root.child("onekvm-lazy-dma").prop("memory-region"))
+        self.assertEqual(len(fdt.root.child("reserved-memory").children), 2)
+
+    def test_lazy_dma_rejects_another_pool_consumer(self):
+        fdt = pro_fdt()
+        fdt.root.children.append(Node("other-device", [("memory-region", u32(10))]))
+        before = tool.serialize(fdt)
+        with self.assertRaisesRegex(DtbError, "another device"):
+            tool.lazy_pool(fdt, 64)
+        self.assertEqual(tool.serialize(fdt), before)
+
+    def test_lazy_dma_invalid_size_leaves_input_unchanged(self):
+        for size in (-4, 3, 100):
+            fdt = pro_fdt()
+            before = tool.serialize(fdt)
+            with self.assertRaises(DtbError):
+                tool.lazy_pool(fdt, size)
+            self.assertEqual(tool.serialize(fdt), before)
+
     def test_both_pools_become_reusable_in_place(self):
         fdt = pro_fdt()
         lent = dict(tool.lend_pools(fdt))

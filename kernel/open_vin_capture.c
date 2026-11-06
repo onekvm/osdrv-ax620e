@@ -408,6 +408,8 @@ static inline void ovc_rmw(struct ovc_dev *ovc, u32 off, u32 keep, u32 set)
 /* what the WDMA address register consumes (spec §3.1).                     */
 /* ------------------------------------------------------------------------ */
 
+#include "lazy_dma_client.h"
+
 struct ovc_mem_buf {
 	struct device *dev;
 	void *vaddr;
@@ -415,6 +417,7 @@ struct ovc_mem_buf {
 	unsigned long size;
 	refcount_t refcount;
 	struct vb2_vmarea_handler handler;
+	struct ax_lazy_buffer lazy;
 };
 
 static void ovc_mem_put(void *buf_priv)
@@ -422,8 +425,11 @@ static void ovc_mem_put(void *buf_priv)
 	struct ovc_mem_buf *buf = buf_priv;
 
 	if (refcount_dec_and_test(&buf->refcount)) {
-		dma_free_coherent(buf->dev, buf->size, buf->vaddr,
-				  buf->dma_addr);
+		if (buf->lazy.dbuf)
+			ax_lazy_free(&buf->lazy);
+		else
+			dma_free_coherent(buf->dev, buf->size, buf->vaddr,
+					  buf->dma_addr);
 		kfree(buf);
 	}
 }
@@ -432,6 +438,7 @@ static void *ovc_mem_alloc(struct vb2_buffer *vb, struct device *dev,
 			   unsigned long size)
 {
 	struct ovc_mem_buf *buf;
+	int ret;
 
 	if (WARN_ON(!dev))
 		return ERR_PTR(-EINVAL);
@@ -442,8 +449,18 @@ static void *ovc_mem_alloc(struct vb2_buffer *vb, struct device *dev,
 
 	buf->dev = dev;
 	buf->size = size;
-	buf->vaddr = dma_alloc_coherent(dev, size, &buf->dma_addr,
-					GFP_KERNEL);
+	if (ax_lazy_enabled(dev)) {
+		ret = ax_lazy_alloc(dev, size, &buf->lazy, true);
+		if (ret) {
+			kfree(buf);
+			return ERR_PTR(ret);
+		}
+		buf->vaddr = buf->lazy.map.vaddr;
+		buf->dma_addr = sg_dma_address(buf->lazy.sgt->sgl);
+	} else {
+		buf->vaddr = dma_alloc_coherent(dev, size, &buf->dma_addr,
+						GFP_KERNEL);
+	}
 	if (!buf->vaddr) {
 		dev_err(dev, "coherent alloc of %lu bytes failed (carveout full?)\n",
 			size);
@@ -495,6 +512,8 @@ static int ovc_mem_mmap(void *buf_priv, struct vm_area_struct *vma)
 	 * mainline dma-contig mmap op clears it the same way).
 	 */
 	vma->vm_pgoff = 0;
+	if (buf->lazy.dbuf)
+		return dma_buf_mmap(buf->lazy.dbuf, vma, 0);
 
 	/* Handled by dma_mmap_from_dev_coherent() for declared regions. */
 	ret = dma_mmap_coherent(buf->dev, vma, buf->vaddr, buf->dma_addr,
@@ -610,6 +629,10 @@ static struct dma_buf *ovc_mem_get_dmabuf(struct vb2_buffer *vb,
 	struct ovc_mem_buf *buf = buf_priv;
 	struct dma_buf *dbuf;
 	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
+	if (buf->lazy.dbuf) {
+		get_dma_buf(buf->lazy.dbuf);
+		return buf->lazy.dbuf;
+	}
 
 	exp_info.ops = &ovc_dmabuf_ops;
 	exp_info.size = buf->size;
@@ -1696,11 +1719,17 @@ static int ovc_probe(struct platform_device *pdev)
 	 * was dma_declare_coherent_memory() over numbers a shell loader
 	 * computed from the board id.
 	 */
-	ret = of_reserved_mem_device_init(dev);
+	ret = ax_lazy_enabled(dev) ? ax_lazy_ready(dev) :
+		of_reserved_mem_device_init(dev);
 	if (ret)
 		return dev_err_probe(dev, ret, "capture memory-region\n");
 
 	rmem_np = of_parse_phandle(dev->of_node, "memory-region", 0);
+	if (ax_lazy_enabled(dev)) {
+		/* Preserve the capture budget without reserving private memory. */
+		ovc->carveout_size = 96ULL << 20;
+		ovc->carveout_cma = true;
+	}
 	if (rmem_np) {
 		struct reserved_mem *rmem = of_reserved_mem_lookup(rmem_np);
 
@@ -1710,6 +1739,7 @@ static int ovc_probe(struct platform_device *pdev)
 		of_node_put(rmem_np);
 	}
 	dev_info(dev, "capture %s %pa bytes\n",
+		 ax_lazy_enabled(dev) ? "lazy DMA budget" :
 		 ovc->carveout_cma ? "reusable CMA" : "carveout", &ovc->carveout_size);
 
 	/*

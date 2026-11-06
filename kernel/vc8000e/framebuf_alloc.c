@@ -32,13 +32,17 @@
 #include <linux/dma-mapping.h>
 #include <linux/scatterlist.h>
 #include <linux/err.h>
+#include <linux/of_reserved_mem.h>
 
 #include "framebuf_alloc.h"
+#include "../lazy_dma_client.h"
 
 static unsigned long framebuf_base;
 static unsigned long framebuf_size;
 static bool framebuf_cma;
 static struct device *fb_dev;
+static phys_addr_t cmdbuf_base;
+static size_t cmdbuf_size;
 
 void vcmd_fb_set_region(unsigned long base, unsigned long size, bool cma)
 {
@@ -53,6 +57,7 @@ struct fb_alloc {
 	unsigned long size;
 	struct file *owner;
 	struct page *page;       /* CMA backing only */
+	struct ax_lazy_buffer lazy;
 };
 
 static LIST_HEAD(fb_list);
@@ -60,6 +65,8 @@ static DEFINE_MUTEX(fb_lock);
 
 static void fb_free(struct fb_alloc *a)
 {
+	if (a->lazy.dbuf)
+		ax_lazy_free(&a->lazy);
 	if (a->page) {
 		/* Drop CPU cache lines of the linear alias before Linux reuses
 		 * the pages; userspace and the encoder bypassed them. */
@@ -85,9 +92,17 @@ static void fb_insert(struct fb_alloc *n)
 static int fb_alloc_cma(struct fb_alloc *n)
 {
 	dma_addr_t dma;
+	int ret;
 
 	if (!fb_dev)
 		return -ENODEV;
+	if (ax_lazy_enabled(fb_dev)) {
+		ret = ax_lazy_alloc(fb_dev, n->size, &n->lazy, false);
+		if (ret)
+			return ret;
+		n->bus = sg_dma_address(n->lazy.sgt->sgl);
+		goto insert;
+	}
 	/* May migrate movable pages out of the area; do not hold fb_lock. */
 	n->page = dma_alloc_pages(fb_dev, n->size, &dma, DMA_BIDIRECTIONAL,
 				  GFP_KERNEL | __GFP_NOWARN);
@@ -98,6 +113,7 @@ static int fb_alloc_cma(struct fb_alloc *n)
 	 * the buffer. */
 	dma_sync_single_for_device(fb_dev, dma, n->size, DMA_BIDIRECTIONAL);
 	n->bus = dma;
+insert:
 	mutex_lock(&fb_lock);
 	fb_insert(n);
 	mutex_unlock(&fb_lock);
@@ -119,7 +135,7 @@ int vcmd_fb_alloc(struct file *filp, unsigned long size, unsigned long *bus)
 	n->size = size;
 	n->owner = filp;
 
-	if (framebuf_cma) {
+	if (framebuf_cma || (fb_dev && ax_lazy_enabled(fb_dev))) {
 		int ret = fb_alloc_cma(n);
 
 		if (ret) {
@@ -210,6 +226,48 @@ int vcmd_fb_lookup(unsigned long phy, unsigned long *size)
 	return ret;
 }
 
+/* Keep dma-buf pages alive until the final user VMA closes, even if its
+ * allocation is freed first. The command pools retain their legacy mapping.
+ */
+int vcmd_fb_remap_pfn_range(struct vm_area_struct *vma, unsigned long addr,
+			    unsigned long pfn, unsigned long size, pgprot_t prot)
+{
+	struct fb_alloc *a;
+	struct dma_buf *dbuf = NULL;
+	int ret = 0;
+
+	mutex_lock(&fb_lock);
+	list_for_each_entry(a, &fb_list, node) {
+		if (a->bus != (pfn << PAGE_SHIFT))
+			continue;
+		if (a->owner != vma->vm_file)
+			ret = -EPERM;
+		else if (a->lazy.dbuf) {
+			dbuf = a->lazy.dbuf;
+			get_dma_buf(dbuf);
+		}
+		break;
+	}
+	mutex_unlock(&fb_lock);
+	if (ret)
+		return ret;
+	if (!dbuf) {
+		unsigned long base = pfn << PAGE_SHIFT;
+
+		/* A concurrent FREE may have removed the frame buffer since
+		 * the legacy lookup. Only the fixed command pool may fall back.
+		 */
+		if (ax_lazy_enabled(fb_dev) &&
+		    (base < cmdbuf_base || base - cmdbuf_base >= cmdbuf_size ||
+		     size > cmdbuf_size - (base - cmdbuf_base)))
+			return -ENOENT;
+		return remap_pfn_range(vma, addr, pfn, size, prot);
+	}
+	ret = dma_buf_mmap(dbuf, vma, 0);
+	dma_buf_put(dbuf);
+	return ret;
+}
+
 /* ------------------------------------------------------------------------ */
 /* dma-buf import (#60 M3): V4L2 capture frame -> encoder bus address       */
 /* ------------------------------------------------------------------------ */
@@ -228,7 +286,25 @@ static LIST_HEAD(imp_list);            /* guarded by fb_lock */
 
 void vcmd_fb_set_dev(struct device *dev)
 {
+	struct device_node *np;
+	struct reserved_mem *rmem;
+	int index;
+
 	fb_dev = dev;
+	cmdbuf_base = 0;
+	cmdbuf_size = 0;
+	if (!dev || !ax_lazy_enabled(dev))
+		return;
+	index = of_property_match_string(dev->of_node, "memory-region-names", "cmdbuf");
+	if (index < 0)
+		return;
+	np = of_parse_phandle(dev->of_node, "memory-region", index);
+	rmem = of_reserved_mem_lookup(np);
+	if (rmem) {
+		cmdbuf_base = rmem->base;
+		cmdbuf_size = rmem->size;
+	}
+	of_node_put(np);
 }
 
 static void imp_drop(struct fb_import *im)

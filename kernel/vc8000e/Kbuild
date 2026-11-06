@@ -16,6 +16,6 @@ ccflags-y += -Wno-unused-variable -Wno-unused-function
 obj-m += ax630c_venc_vcmd.o
 ax630c_venc_vcmd-y := ax630c_vcmd_glue.o \
 		      framebuf_alloc.o \
-		      eswin/vc8000_vcmd_driver.o \
+		      vcmd_core.o \
 		      eswin/vcmdswhwregisters.o \
 		      eswin/bidirect_list.o

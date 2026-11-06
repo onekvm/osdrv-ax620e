@@ -46,6 +46,7 @@ struct dmabuf_import_parameter {
 #define HANTRO_IOCH_RELEASE_DMABUF _IOWR('k', 39, struct dmabuf_import_parameter)
 
 #ifdef __KERNEL__
+#include <linux/mm.h>
 struct file;
 struct device;
 
@@ -63,6 +64,8 @@ int vcmd_dmabuf_import(struct file *filp, int fd, unsigned long *bus,
 int vcmd_dmabuf_release(struct file *filp, unsigned long bus);
 /* mmap support: 0 + size out if phy is an allocation's base */
 int vcmd_fb_lookup(unsigned long phy, unsigned long *size);
+int vcmd_fb_remap_pfn_range(struct vm_area_struct *vma, unsigned long addr,
+			    unsigned long pfn, unsigned long size, pgprot_t prot);
 #endif
 
 #endif /* FRAMEBUF_ALLOC_H */

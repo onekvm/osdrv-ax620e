@@ -54,6 +54,7 @@
 
 #include "vc8000_driver.h"	/* struct vcmd_config, extern venc_pdev, ABI */
 #include "framebuf_alloc.h"	/* vcmd_fb_set_dev / vcmd_fb_set_region */
+#include "../lazy_dma_client.h"
 
 /* --- symbols the VCMD core (eswin/vc8000_vcmd_driver.c) imports --- */
 struct platform_device *venc_pdev;
@@ -138,6 +139,11 @@ static int ax630c_vcmd_probe(struct platform_device *pdev)
 
 	if (venc_pdev)
 		return -EBUSY;	/* the core is a singleton */
+	if (ax_lazy_enabled(dev)) {
+		ret = ax_lazy_ready(dev);
+		if (ret)
+			return dev_err_probe(dev, ret, "lazy DMA supplier\n");
+	}
 
 	vc = devm_kzalloc(dev, sizeof(*vc), GFP_KERNEL);
 	if (!vc)
@@ -168,6 +174,11 @@ static int ax630c_vcmd_probe(struct platform_device *pdev)
 	ret = of_reserved_mem_device_init_by_name(dev, dev->of_node, "cmdbuf");
 	if (ret)
 		return dev_err_probe(dev, ret, "cmdbuf memory-region\n");
+	if (ax_lazy_enabled(dev)) {
+		vcmd_fb_set_region(0, 96UL << 20, false);
+		dev_info(dev, "framebuf lazy DMA (96 MiB request limit)\n");
+		goto framebuf_ready;
+	}
 
 	/*
 	 * "framebuf": encoder frame buffers. A no-map region is carved by
@@ -204,6 +215,7 @@ static int ax630c_vcmd_probe(struct platform_device *pdev)
 	dev_info(dev, "framebuf %s %pa + %pa\n", fb_cma ? "reusable CMA" : "carveout",
 		 &rmem->base, &rmem->size);
 
+framebuf_ready:
 	vc->clk = devm_clk_get(dev, NULL);
 	if (IS_ERR(vc->clk)) {
 		ret = dev_err_probe(dev, PTR_ERR(vc->clk), "venc clock\n");
