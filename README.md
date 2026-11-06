@@ -11,20 +11,20 @@ NanoKVM Pro（AX630C）与 NanoKVM Go（AX620Q）的自有视频驱动，作为�
 
 | 路径 | 内容 |
 | --- | --- |
-| `tools/ax620e_media_dtb.py` | 改写 Pro 内核 DTB：两个私有区替换为共享 lazy-dma 池，或兼容原有的独立 reusable CMA；由 distro 构建启动 DTB 时调用 |
+| `tools/ax620e_media_dtb.py` | 改写 Pro 内核 DTB：两个私有区替换为共享 lazy-cma 池，或兼容原有的独立 reusable CMA；由 distro 构建启动 DTB 时调用 |
 | `tests/` | 主机测试：`make -C tests test` |
 
 ## 内存
 
-Pro 默认由 VIN 与 VENC 共用 `onekvm-lazy-dma`。采集帧优先从普通内存按需迁出，编码器大块优先从共享的 96 MiB reusable CMA 池取得；释放后保留复用，压力下归还 Linux。默认 100 MiB CMA 与固定 8 MiB 命令区不变。机型变量为 `ONEKVM_PRO_LAZY_DMA` 和 `ONEKVM_PRO_LAZY_DMA_POOL_MIB`，不改内核 dts。 `--lazy-pool-mib` 接受 0–96 MiB 的 4 MiB 倍数；0 只适合不依赖大块后备的实验。4K30 压力下仍需约 90.9 MiB CMA，默认共享池保持 96 MiB。
+Pro 默认由 VIN 与 VENC 共用 `onekvm-lazy-cma`。采集帧优先从普通内存按需迁出，编码器大块优先从共享的 96 MiB reusable CMA 池取得；释放后保留复用，压力下归还 Linux。默认 100 MiB CMA 与固定 8 MiB 命令区不变。机型变量为 `ONEKVM_PRO_LAZY_CMA` 和 `ONEKVM_PRO_LAZY_CMA_POOL_MIB`，不改内核 dts。 `--lazy-pool-mib` 接受 0–96 MiB 的 4 MiB 倍数；0 只适合不依赖大块后备的实验。4K30 压力下仍需约 90.9 MiB CMA，默认共享池保持 96 MiB。
 
-设备通过 `onekvm,lazy-dma` phandle 选择共享供应者。VIN 的 vb2 缓冲由 dma-buf 持有、映射并原样导出；VENC 仍向用户态返回总线地址，mmap 由 dma-buf 保持页的引用。`vcmd_core.c` 适配映射入口，不修改 `eswin/` 供应商源码。分配 FREE／关闭设备 fd 后，活跃 VMA 继续持有缓冲，最后一个引用关闭才进入保留池。
+设备通过 `onekvm,lazy-cma` phandle 选择共享供应者。VIN 的 vb2 缓冲由 dma-buf 持有、映射并原样导出；VENC 仍向用户态返回总线地址，mmap 由 dma-buf 保持页的引用。`vcmd_core.c` 适配映射入口，不修改 `eswin/` 供应商源码。分配 FREE／关闭设备 fd 后，活跃 VMA 继续持有缓冲，最后一个引用关闭才进入保留池。
 
 没有此 phandle 时继续兼容原有设备树：
 
 - VIN：`dma_alloc_coherent()` 从设备 CMA 区分配。缓冲数上限按实际占用估算：`no-map` 区每块按 2 的幂取整，CMA 区按 `CONFIG_CMA_ALIGNMENT`（1 MiB）取整，4096×2160 每块 17 MiB，96 MiB 可放 5 块（原按 32 MiB 估只放 3 块）。
 - VC8000E：区域为 `reusable` 时每次 `HANTRO_IOCH_ALLOC_FRAMEBUF` 调用 `dma_alloc_pages()`，释放即归还；仍为 `no-map` 时沿用固定区间内的地址分配。用户态 ABI 不变。
-- `ONEKVM_PRO_MEDIA_REUSABLE=1` 且 `ONEKVM_PRO_LAZY_DMA=0` 时保留两个独立 reusable 池；关闭前者则保留 no-map 布局。Go 沿用原有布局。
+- `ONEKVM_PRO_MEDIA_REUSABLE=1` 且 `ONEKVM_PRO_LAZY_CMA=0` 时保留两个独立 reusable 池；关闭前者则保留 no-map 布局。Go 沿用原有布局。
 
 `tests/dma-lifetime.c` 是实机测试，经 distro 编译为 `ax620e-dma-lifetime-test` 部署产物；停止视频服务后检查清零、跨所有者映射拒绝，以及 FREE／close／reclaim 期间的活跃映射。主机布局测试继续用 `make -C tests test`。
 

@@ -35,7 +35,7 @@
 #include <linux/of_reserved_mem.h>
 
 #include "framebuf_alloc.h"
-#include "../lazy_dma_client.h"
+#include "../lazy_cma_client.h"
 
 static unsigned long framebuf_base;
 static unsigned long framebuf_size;

@@ -54,7 +54,7 @@
 
 #include "vc8000_driver.h"	/* struct vcmd_config, extern venc_pdev, ABI */
 #include "framebuf_alloc.h"	/* vcmd_fb_set_dev / vcmd_fb_set_region */
-#include "../lazy_dma_client.h"
+#include "../lazy_cma_client.h"
 
 /* --- symbols the VCMD core (eswin/vc8000_vcmd_driver.c) imports --- */
 struct platform_device *venc_pdev;
@@ -142,7 +142,7 @@ static int ax630c_vcmd_probe(struct platform_device *pdev)
 	if (ax_lazy_enabled(dev)) {
 		ret = ax_lazy_ready(dev);
 		if (ret)
-			return dev_err_probe(dev, ret, "lazy DMA supplier\n");
+			return dev_err_probe(dev, ret, "lazy CMA supplier\n");
 	}
 
 	vc = devm_kzalloc(dev, sizeof(*vc), GFP_KERNEL);
@@ -176,7 +176,7 @@ static int ax630c_vcmd_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret, "cmdbuf memory-region\n");
 	if (ax_lazy_enabled(dev)) {
 		vcmd_fb_set_region(0, 96UL << 20, false);
-		dev_info(dev, "framebuf lazy DMA (96 MiB request limit)\n");
+		dev_info(dev, "framebuf lazy CMA (96 MiB request limit)\n");
 		goto framebuf_ready;
 	}
 

@@ -1,13 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifndef AX620E_LAZY_DMA_CLIENT_H
-#define AX620E_LAZY_DMA_CLIENT_H
+#ifndef AX620E_LAZY_CMA_CLIENT_H
+#define AX620E_LAZY_CMA_CLIENT_H
 
 #include <linux/dma-buf.h>
 #include <linux/iosys-map.h>
 #include <linux/of.h>
 #include <linux/scatterlist.h>
-#ifdef ONEKVM_LAZY_DMA
-#include <onekvm/lazy_dma.h>
+#ifdef ONEKVM_LAZY_CMA
+#include <onekvm/lazy_cma.h>
 #endif
 
 struct ax_lazy_buffer {
@@ -19,13 +19,13 @@ struct ax_lazy_buffer {
 
 static inline bool ax_lazy_enabled(struct device *dev)
 {
-	return dev && of_property_present(dev->of_node, "onekvm,lazy-dma");
+	return dev && of_property_present(dev->of_node, "onekvm,lazy-cma");
 }
 
 static inline int ax_lazy_ready(struct device *dev)
 {
-#ifdef ONEKVM_LAZY_DMA
-	return onekvm_lazy_dma_ready(dev);
+#ifdef ONEKVM_LAZY_CMA
+	return onekvm_lazy_cma_ready(dev);
 #else
 	return -EOPNOTSUPP;
 #endif
@@ -46,10 +46,10 @@ static inline void ax_lazy_free(struct ax_lazy_buffer *buf)
 static inline int ax_lazy_alloc(struct device *dev, unsigned long size,
 				struct ax_lazy_buffer *buf, bool vmap)
 {
-#ifdef ONEKVM_LAZY_DMA
+#ifdef ONEKVM_LAZY_CMA
 	int ret;
 
-	buf->dbuf = onekvm_lazy_dma_alloc(dev, size);
+	buf->dbuf = onekvm_lazy_cma_alloc(dev, size);
 	if (IS_ERR(buf->dbuf)) {
 		ret = PTR_ERR(buf->dbuf);
 		buf->dbuf = NULL;

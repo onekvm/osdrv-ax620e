@@ -408,7 +408,7 @@ static inline void ovc_rmw(struct ovc_dev *ovc, u32 off, u32 keep, u32 set)
 /* what the WDMA address register consumes (spec §3.1).                     */
 /* ------------------------------------------------------------------------ */
 
-#include "lazy_dma_client.h"
+#include "lazy_cma_client.h"
 
 struct ovc_mem_buf {
 	struct device *dev;
@@ -1739,7 +1739,7 @@ static int ovc_probe(struct platform_device *pdev)
 		of_node_put(rmem_np);
 	}
 	dev_info(dev, "capture %s %pa bytes\n",
-		 ax_lazy_enabled(dev) ? "lazy DMA budget" :
+		 ax_lazy_enabled(dev) ? "lazy CMA budget" :
 		 ovc->carveout_cma ? "reusable CMA" : "carveout", &ovc->carveout_size);
 
 	/*

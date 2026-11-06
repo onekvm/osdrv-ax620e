@@ -324,8 +324,8 @@ def lazy_pool(fdt: Fdt, pool_mib: int) -> list[tuple[str, Region]]:
     if pool_mib < 0 or pool_mib % 4:
         raise DtbError("lazy pool must be a nonnegative multiple of 4 MiB")
     out = parse(serialize(fdt))
-    if any("onekvm,lazy-dma" in n.compatible() for n in walk(out.root)):
-        raise DtbError("input already has a lazy DMA device")
+    if any("onekvm,lazy-cma" in n.compatible() for n in walk(out.root)):
+        raise DtbError("input already has a lazy CMA device")
     lent = dict(lend_pools(out))
     root = out.root
     resmem = root.child("reserved-memory")
@@ -346,8 +346,8 @@ def lazy_pool(fdt: Fdt, pool_mib: int) -> list[tuple[str, Region]]:
     if pool_mib * MIB > old.size:
         raise DtbError("lazy pool exceeds the former encoder frame-buffer region")
     phandle = max_phandle(root) + 1
-    supplier = Node("onekvm-lazy-dma", [
-        ("compatible", b"onekvm,lazy-dma\0"),
+    supplier = Node("onekvm-lazy-cma", [
+        ("compatible", b"onekvm,lazy-cma\0"),
         ("phandle", struct.pack(">I", phandle)),
     ])
     vin.props = [(k, v) for k, v in vin.props
@@ -358,13 +358,13 @@ def lazy_pool(fdt: Fdt, pool_mib: int) -> list[tuple[str, Region]]:
     venc.set("memory-region-names", b"".join(name + b"\0" for name, _ in keep))
     venc.set("memory-region", struct.pack(f">{len(keep)}I", *(ref for _, ref in keep)))
     for device in devices:
-        device.set("onekvm,lazy-dma", struct.pack(">I", phandle))
+        device.set("onekvm,lazy-cma", struct.pack(">I", phandle))
     resmem.children = [n for n in resmem.children if n not in (capture, framebuf)]
     regions = []
     if pool_mib:
         region = Region(old.start, old.start + pool_mib * MIB)
         pool_phandle = phandle + 1
-        pool = Node(f"onekvm-lazy-dma@{region.start:x}", [
+        pool = Node(f"onekvm-lazy-cma@{region.start:x}", [
             ("compatible", b"shared-dma-pool\0"), ("reusable", b""),
             ("reg", encode_reg(region, cells(resmem, "#address-cells", 2),
                                cells(resmem, "#size-cells", 2))),
@@ -383,7 +383,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--lazy-pool-mib", type=int,
-                        help="use shared lazy DMA instead of private pools (0: ordinary memory only)")
+                        help="use shared lazy CMA instead of private pools (0: ordinary memory only)")
     args = parser.parse_args(argv)
     try:
         fdt = parse(args.input.read_bytes())

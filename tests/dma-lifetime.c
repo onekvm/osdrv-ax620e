@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Device test: a freed ioctl allocation must remain pinned by its user VMA.
- * Run with the video service stopped, on a lazy-dma device tree.
+ * Run with the video service stopped, on a lazy-cma device tree.
  */
 #define _FILE_OFFSET_BITS 64
 #include <errno.h>
@@ -14,8 +14,8 @@
 #include "../kernel/vc8000e/framebuf_alloc.h"
 
 #define BYTES (1024UL * 1024)
-#define STATS "/sys/devices/platform/onekvm-lazy-dma/stats"
-#define RECLAIM "/sys/devices/platform/onekvm-lazy-dma/reclaim"
+#define STATS "/sys/devices/platform/onekvm-lazy-cma/stats"
+#define RECLAIM "/sys/devices/platform/onekvm-lazy-cma/reclaim"
 
 static unsigned long long used(void)
 {
