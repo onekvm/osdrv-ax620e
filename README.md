@@ -8,9 +8,11 @@ NanoKVM Pro（AX630C）与 NanoKVM Go（AX620Q）的自有视频驱动，作为�
 | `open_vin_capture.ko` | `kernel/open_vin_capture.c` | VIN/IFE 采集 `/dev/video*`，缓冲可导出 dma-buf |
 | `ax630c_venc_vcmd.ko` | `kernel/vc8000e/` | VC8000E 编码命令引擎、帧缓冲分配与 dma-buf 导入 |
 | `ax630c_tdp.ko` | `kernel/ax630c_tdp.c` | TDP V4L2 mem2mem 缩放与色彩转换 |
+| `onekvm_ax630c_npu.ko` | `kernel/npu/` | NPU：上电、连续缓冲、OCM 映射、启动程序并等完成中断；`/dev/onekvm-ax-npu`，接口 `include/uapi/onekvm/ax630c_npu.h`。按实测硬件行为编写，不含厂商代码；用户态见 onekvm-npu 的 `ax` 后端 |
 
 | 路径 | 内容 |
 | --- | --- |
+| `tools/ax630c_npu_dtb.py` | 在 Pro DTB 的 `/soc` 下加入 NPU 节点（`onekvm,ax630c-npu`，寄存器 0x3800000、OCM 0x3000000、PMU 0x2100000，SPI 38/42）；内核 dts 不描述 NPU，由 distro 打包启动 DTB 时调用 |
 | `tools/ax620e_media_dtb.py` | 改写 Pro 内核 DTB：两个私有区替换为共享 lazy-cma 池，或兼容原有的独立 reusable CMA；由 distro 构建启动 DTB 时调用 |
 | `tests/` | 主机测试：`make -C tests test` |
 

@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: GPL-2.0-only
+obj-m += onekvm_ax630c_npu.o
+onekvm_ax630c_npu-y := ax630c_npu.o
