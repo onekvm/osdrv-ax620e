@@ -7,7 +7,9 @@
  * model (program bytes, OCM address table, queue descriptors, parameters).
  *
  * mmap offsets: ONEKVM_AXNPU_OCM_OFFSET maps the OCM (uncached); a buffer is
- * mapped at the offset returned by ALLOC.
+ * mapped at the offset returned by ALLOC. Buffers are mapped cached: SYNC
+ * them to the device after the CPU writes and from the device before the
+ * CPU reads what the NPU wrote.
  */
 #ifndef ONEKVM_AX630C_NPU_H
 #define ONEKVM_AX630C_NPU_H
@@ -48,9 +50,20 @@ struct onekvm_axnpu_run {
 	__u32 elapsed_us;      /* out */
 };
 
+#define ONEKVM_AXNPU_SYNC_TO_DEVICE   1u
+#define ONEKVM_AXNPU_SYNC_FROM_DEVICE 2u
+
+struct onekvm_axnpu_sync {
+	__u32 handle;
+	__u32 direction;       /* ONEKVM_AXNPU_SYNC_* */
+	__u64 offset;
+	__u64 size;            /* 0 = to the end of the buffer */
+};
+
 #define ONEKVM_AXNPU_IOC_INFO  _IOR('X', 0x40, struct onekvm_axnpu_info)
 #define ONEKVM_AXNPU_IOC_ALLOC _IOWR('X', 0x41, struct onekvm_axnpu_alloc)
 #define ONEKVM_AXNPU_IOC_FREE  _IOW('X', 0x42, __u32)
 #define ONEKVM_AXNPU_IOC_RUN   _IOWR('X', 0x43, struct onekvm_axnpu_run)
+#define ONEKVM_AXNPU_IOC_SYNC  _IOW('X', 0x44, struct onekvm_axnpu_sync)
 
 #endif

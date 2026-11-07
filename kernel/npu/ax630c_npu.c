@@ -92,6 +92,11 @@
 
 #define OCM_SIZE	0x280000
 
+/* Cached buffers with explicit SYNC (default) or uncached coherent ones. */
+static bool cached = true;
+module_param(cached, bool, 0444);
+MODULE_PARM_DESC(cached, "Map NPU buffers cached and sync them explicitly");
+
 struct axnpu {
 	struct device *dev;
 	void __iomem *regs;
@@ -106,10 +111,34 @@ struct axnpu {
 };
 
 struct axnpu_buf {
-	void *cpu;
+	void *cpu;		/* coherent buffers */
+	struct page *pages;	/* cached buffers */
 	dma_addr_t dma;
 	size_t size;
 };
+
+static int axnpu_buf_alloc(struct device *dev, struct axnpu_buf *b)
+{
+	if (cached) {
+		b->pages = dma_alloc_pages(dev, b->size, &b->dma, DMA_BIDIRECTIONAL, GFP_KERNEL);
+		if (!b->pages)
+			return -ENOMEM;
+		memset(page_address(b->pages), 0, b->size);
+		dma_sync_single_for_device(dev, b->dma, b->size, DMA_BIDIRECTIONAL);
+		return 0;
+	}
+	b->cpu = dma_alloc_coherent(dev, b->size, &b->dma, GFP_KERNEL);
+	return b->cpu ? 0 : -ENOMEM;
+}
+
+static void axnpu_buf_free(struct device *dev, struct axnpu_buf *b)
+{
+	if (b->pages)
+		dma_free_pages(dev, b->size, b->pages, b->dma, DMA_BIDIRECTIONAL);
+	else
+		dma_free_coherent(dev, b->size, b->cpu, b->dma);
+	kfree(b);
+}
 
 struct axnpu_file {
 	struct axnpu *npu;
@@ -343,15 +372,14 @@ static long axnpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (!b)
 			return -ENOMEM;
 		b->size = PAGE_ALIGN(a.size);
-		b->cpu = dma_alloc_coherent(f->npu->dev, b->size, &b->dma, GFP_KERNEL);
-		if (!b->cpu) {
+		rc = axnpu_buf_alloc(f->npu->dev, b);
+		if (rc) {
 			kfree(b);
-			return -ENOMEM;
+			return rc;
 		}
 		rc = xa_alloc(&f->bufs, &id, b, XA_LIMIT(1, 0xffff), GFP_KERNEL);
 		if (rc) {
-			dma_free_coherent(f->npu->dev, b->size, b->cpu, b->dma);
-			kfree(b);
+			axnpu_buf_free(f->npu->dev, b);
 			return rc;
 		}
 		a.phys = b->dma;
@@ -359,8 +387,7 @@ static long axnpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		a.mmap_offset = (u64)id << 28;
 		if (copy_to_user(uarg, &a, sizeof(a))) {
 			xa_erase(&f->bufs, id);
-			dma_free_coherent(f->npu->dev, b->size, b->cpu, b->dma);
-			kfree(b);
+			axnpu_buf_free(f->npu->dev, b);
 			return -EFAULT;
 		}
 		return 0;
@@ -377,8 +404,34 @@ static long axnpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		mutex_unlock(&f->npu->lock);
 		if (!b)
 			return -ENOENT;
-		dma_free_coherent(f->npu->dev, b->size, b->cpu, b->dma);
-		kfree(b);
+		axnpu_buf_free(f->npu->dev, b);
+		return 0;
+	}
+	case ONEKVM_AXNPU_IOC_SYNC: {
+		struct onekvm_axnpu_sync y;
+		struct axnpu_buf *b;
+		u64 size;
+
+		if (copy_from_user(&y, uarg, sizeof(y)))
+			return -EFAULT;
+		mutex_lock(&f->lock);
+		b = xa_load(&f->bufs, y.handle);
+		size = y.size ? y.size : (b && y.offset < b->size ? b->size - y.offset : 0);
+		if (!b || y.offset >= b->size || size > b->size - y.offset ||
+		    (y.direction != ONEKVM_AXNPU_SYNC_TO_DEVICE &&
+		     y.direction != ONEKVM_AXNPU_SYNC_FROM_DEVICE)) {
+			mutex_unlock(&f->lock);
+			return -EINVAL;
+		}
+		if (b->pages) {
+			if (y.direction == ONEKVM_AXNPU_SYNC_TO_DEVICE)
+				dma_sync_single_for_device(f->npu->dev, b->dma + y.offset, size,
+							   DMA_BIDIRECTIONAL);
+			else
+				dma_sync_single_for_cpu(f->npu->dev, b->dma + y.offset, size,
+							DMA_BIDIRECTIONAL);
+		}
+		mutex_unlock(&f->lock);
 		return 0;
 	}
 	case ONEKVM_AXNPU_IOC_RUN: {
@@ -418,6 +471,8 @@ static int axnpu_mmap(struct file *file, struct vm_area_struct *vma)
 	if (!b || len > b->size)
 		return -EINVAL;
 	vma->vm_pgoff = 0;
+	if (b->pages)
+		return dma_mmap_pages(f->npu->dev, vma, len, b->pages);
 	return dma_mmap_coherent(f->npu->dev, vma, b->cpu, b->dma, len);
 }
 
@@ -443,10 +498,8 @@ static int axnpu_release(struct inode *inode, struct file *file)
 
 	mutex_lock(&f->npu->lock);	/* no program of this client runs */
 	mutex_unlock(&f->npu->lock);
-	xa_for_each(&f->bufs, id, b) {
-		dma_free_coherent(f->npu->dev, b->size, b->cpu, b->dma);
-		kfree(b);
-	}
+	xa_for_each(&f->bufs, id, b)
+		axnpu_buf_free(f->npu->dev, b);
 	xa_destroy(&f->bufs);
 	kfree(f);
 	return 0;
