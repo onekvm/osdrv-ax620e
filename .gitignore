@@ -7,3 +7,4 @@ Module.symvers
 modules.order
 local-docs/
 __pycache__/
+tests/venc_rc/test_venc_rc

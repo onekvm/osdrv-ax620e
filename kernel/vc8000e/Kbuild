@@ -19,3 +19,14 @@ ax630c_venc_vcmd-y := ax630c_vcmd_glue.o \
 		      vcmd_core.o \
 		      eswin/vcmdswhwregisters.o \
 		      eswin/bidirect_list.o
+
+# V4L2 encoder: builds the vendored vcenc headers (vcenc/UPSTREAM.md)
+# unmodified against kernel stand-ins for <stdint.h> and <string.h>.
+obj-m += ax630c_venc_v4l2.o
+CFLAGS_ax630c_venc_v4l2.o += -I$(src)/vcenc/include -I$(src)/vcenc \
+			     -Wno-declaration-after-statement
+# The lazy CMA include directory is a user-space sysroot whose <stdint.h>
+# would shadow the stand-in; the encoder does not use lazy CMA.
+ifneq ($(ONEKVM_LAZY_CMA_INCLUDE),)
+CFLAGS_REMOVE_ax630c_venc_v4l2.o += -I$(ONEKVM_LAZY_CMA_INCLUDE)
+endif

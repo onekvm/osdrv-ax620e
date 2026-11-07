@@ -97,6 +97,7 @@ struct ax630c_vcmd {
 	struct clk *clk;
 	struct reset_control *rst;
 	int irq;
+	struct platform_device *v4l2;	/* "ax630c-venc", see below */
 };
 
 static int ax630c_vcmd_runtime_suspend(struct device *dev)
@@ -260,6 +261,19 @@ framebuf_ready:
 
 	dev_info(dev, "VC8000E VCMD engine up (base %pa, irq %d)\n",
 		 &res->start, irq);
+	/*
+	 * Device for the optional V4L2 encoder (ax630c_venc_v4l2), an
+	 * in-kernel VCMD client. It is a plain child without this device's
+	 * memory regions, so its buffers come from the default CMA area.
+	 */
+	vc->v4l2 = platform_device_register_full(&(struct platform_device_info){
+		.parent = dev, .name = "ax630c-venc", .id = PLATFORM_DEVID_NONE,
+		.dma_mask = DMA_BIT_MASK(32),
+	});
+	if (IS_ERR(vc->v4l2)) {
+		dev_warn(dev, "V4L2 encoder device: %pe\n", vc->v4l2);
+		vc->v4l2 = NULL;
+	}
 	pm_runtime_mark_last_busy(dev);
 	pm_runtime_put_autosuspend(dev);
 	return 0;
@@ -288,6 +302,7 @@ static void ax630c_vcmd_remove(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	int ret;
 
+	platform_device_unregister(vc->v4l2);
 	/* cleanup touches registers even when the last viewer left long ago. */
 	ret = pm_runtime_resume_and_get(dev);
 	if (ret < 0)
