@@ -80,6 +80,7 @@
 #include <linux/dma-buf.h>
 #include <linux/scatterlist.h>
 
+#include "ovc_frame_interval.h"
 #include "ovc_golden_4k.h"
 
 #define OVC_DRV_NAME		"open_vin_capture"
@@ -347,12 +348,13 @@ struct ovc_dev {
 	bool notifier_registered;
 
 	struct mutex lock;	/* serializes ioctls + queue ops */
-	spinlock_t irqlock;	/* protects buf_list / active / sequence */
+	spinlock_t irqlock;	/* protects buf_list / active / sequence / fi */
 
 	struct vb2_queue queue;
 	struct list_head buf_list;	/* queued, not yet given to hw */
 	struct ovc_buffer *active;	/* buffer the WDMA writes next */
 	unsigned int sequence;
+	struct ovc_fi fi;	/* input frame interval (G_PARM) */
 
 	struct v4l2_pix_format fmt;
 	/* Size of the reserved-memory pool, for the queue_setup buffer cap. */
@@ -1035,6 +1037,7 @@ static irqreturn_t ovc_isr(int irq, void *priv)
 	 * FSOF (group 1 bit0).
 	 */
 	ovc->sequence++;
+	ovc_fi_sample(&ovc->fi, ktime_get_ns());
 	if (ovc->active && !list_empty(&ovc->buf_list)) {
 		struct ovc_buffer *next;
 
@@ -1295,6 +1298,7 @@ static int ovc_start_streaming(struct vb2_queue *vq, unsigned int count)
 	 */
 	spin_lock_irqsave(&ovc->irqlock, flags);
 	ovc->sequence = 0;
+	ovc_fi_start(&ovc->fi);
 	ovc->active = list_first_entry(&ovc->buf_list, struct ovc_buffer,
 				       list);
 	list_del(&ovc->active->list);
@@ -1474,6 +1478,61 @@ static int ovc_enum_framesizes(struct file *file, void *priv,
 	return 0;
 }
 
+/*
+ * The source sets the rate: G_PARM reports the measured input interval
+ * (ovc_frame_interval.h) and S_PARM cannot change it. Until the input has
+ * been captured once the interval is unknown, TIMEPERFRAME is not set and
+ * ENUM_FRAMEINTERVALS has nothing to list. Every size has the same interval:
+ * a smaller format crops the input, it does not change its rate.
+ */
+static int ovc_enum_frameintervals(struct file *file, void *priv,
+				   struct v4l2_frmivalenum *fival)
+{
+	struct ovc_dev *ovc = video_drvdata(file);
+	unsigned long flags;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(ovc_pix_formats); i++)
+		if (fival->pixel_format == ovc_pix_formats[i])
+			break;
+	if (fival->index || i == ARRAY_SIZE(ovc_pix_formats) ||
+	    fival->width < OVC_MIN_WIDTH || fival->width > OVC_MAX_WIDTH ||
+	    (fival->width & 1) || fival->height < OVC_MIN_HEIGHT ||
+	    fival->height > OVC_MAX_HEIGHT)
+		return -EINVAL;
+	spin_lock_irqsave(&ovc->irqlock, flags);
+	fival->discrete = ovc->fi.tpf;
+	spin_unlock_irqrestore(&ovc->irqlock, flags);
+	if (!fival->discrete.denominator)
+		return -EINVAL;
+	fival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
+	return 0;
+}
+
+static int ovc_g_parm(struct file *file, void *priv,
+		      struct v4l2_streamparm *a)
+{
+	struct ovc_dev *ovc = video_drvdata(file);
+	struct v4l2_captureparm *cp = &a->parm.capture;
+	unsigned long flags;
+
+	memset(cp, 0, sizeof(*cp));
+	/* vb2 read() allocates min_queued_buffers + 1 */
+	cp->readbuffers = OVC_MIN_BUFFERS;
+	spin_lock_irqsave(&ovc->irqlock, flags);
+	cp->timeperframe = ovc->fi.tpf;
+	spin_unlock_irqrestore(&ovc->irqlock, flags);
+	if (cp->timeperframe.denominator)
+		cp->capability = V4L2_CAP_TIMEPERFRAME;
+	return 0;
+}
+
+static int ovc_s_parm(struct file *file, void *priv,
+		      struct v4l2_streamparm *a)
+{
+	return ovc_g_parm(file, priv, a);
+}
+
 static const struct v4l2_ioctl_ops ovc_ioctl_ops = {
 	.vidioc_querycap		= ovc_querycap,
 	.vidioc_enum_fmt_vid_cap	= ovc_enum_fmt_vid_cap,
@@ -1484,6 +1543,9 @@ static const struct v4l2_ioctl_ops ovc_ioctl_ops = {
 	.vidioc_g_input			= ovc_g_input,
 	.vidioc_s_input			= ovc_s_input,
 	.vidioc_enum_framesizes		= ovc_enum_framesizes,
+	.vidioc_enum_frameintervals	= ovc_enum_frameintervals,
+	.vidioc_g_parm			= ovc_g_parm,
+	.vidioc_s_parm			= ovc_s_parm,
 
 	.vidioc_reqbufs			= vb2_ioctl_reqbufs,
 	.vidioc_create_bufs		= vb2_ioctl_create_bufs,

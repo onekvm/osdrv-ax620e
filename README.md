@@ -7,7 +7,7 @@ OneKVM's own video drivers for NanoKVM Pro (AX630C) and NanoKVM Go (AX620Q), bui
 | Module | Source | Purpose |
 | --- | --- | --- |
 | `open_vin_csi2.ko` | `kernel/open_vin_csi2.c` | MIPI CSI-2 receiver and D-PHY (V4L2 subdev) |
-| `open_vin_capture.ko` | `kernel/open_vin_capture.c` | VIN/IFE capture `/dev/video*`; buffers can be exported as dma-buf |
+| `open_vin_capture.ko` | `kernel/open_vin_capture.c` | VIN/IFE capture `/dev/video*`; buffers can be exported as dma-buf; `G_PARM`/`ENUM_FRAMEINTERVALS` report the measured input frame rate |
 | `ax630c_venc_vcmd.ko` | `kernel/vc8000e/` | VC8000E encoder command engine, frame buffer allocation and dma-buf import |
 | `ax630c_venc_v4l2.ko` | `kernel/vc8000e/ax630c_venc_v4l2.c` | Optional V4L2 mem2mem encoder: YUYV input, H.264/H.265 output, for GStreamer `v4l2h264enc`/`v4l2h265enc` and ffmpeg `*_v4l2m2m`; packaged separately as `kernel-module-ax630c-venc-v4l2` |
 | `ax630c_tdp.ko` | `kernel/ax630c_tdp.c` | TDP V4L2 mem2mem scaling and color conversion |
@@ -18,7 +18,7 @@ OneKVM's own video drivers for NanoKVM Pro (AX630C) and NanoKVM Go (AX620Q), bui
 | `tools/ax630c_npu_dtb.py` | Adds the NPU node (`onekvm,ax630c-npu`, registers 0x3800000, OCM 0x3000000, PMU 0x2100000, SPI 38/42) under `/soc` in the Pro DTB; the kernel dts does not describe the NPU, so the distro calls this when packaging the boot DTB |
 | `tools/ax620e_media_dtb.py` | Rewrites the Pro kernel DTB: replaces the two private regions with a shared lazy-cma pool, or keeps the legacy separate reusable CMA regions; called by the distro when building the boot DTB |
 | `kernel/vc8000e/vcenc/` | VC8000E register and bitstream-header generation code used by the V4L2 encoder, taken verbatim from onekvm-video-ax630c; provenance in `UPSTREAM.md` |
-| `tests/` | Host tests: `make -C tests test` (includes DTB rewriting, and frame-by-frame comparison of the encoder rate control against the reference implementation) |
+| `tests/` | Host tests: `make -C tests test` (includes DTB rewriting, frame-by-frame comparison of the encoder rate control against the reference implementation, and the VIN frame-rate estimate) |
 
 ## Memory
 
@@ -38,7 +38,7 @@ Without this phandle, the original device trees remain supported:
 
 `ax630c_venc_v4l2` is an in-kernel client of `ax630c_venc_vcmd`: the VCMD driver registers the child device `ax630c-venc`, on which the encoder creates `/dev/videoN` and shares command scheduling with Core's user-space encoding sessions. The OUTPUT queue supports MMAP and DMABUF import; the CAPTURE queue is MMAP. Working buffers come from the default CMA. Rate control is an integer implementation (`ax630c_venc_rc.h`) that matches `vcenc_rc.h` in onekvm-video-ax630c frame for frame. Statistics are in `/sys/bus/platform/devices/ax630c-venc/stats`.
 
-Zero-copy usage: `v4l2src io-mode=dmabuf ! v4l2h264enc output-io-mode=dmabuf-import` measured 60 fps at 1080p60 on device 105 with about 6% process CPU. ffmpeg 8's `v4l2` input and `*_v4l2m2m` only use MMAP copies, and VIN mappings are uncached; measured about 24.5 fps with about 117% process CPU. VIN does not implement `G_PARM`, so ffmpeg cannot get the input frame rate: `-r 60` inserts duplicate frames whenever encoding falls behind, and the backlog keeps growing; `-fps_mode passthrough` inserts no frames, but the encoder computes rate control and level at 240 fps. Each queue holds at most 16 buffers, all from the default CMA.
+Zero-copy usage: `v4l2src io-mode=dmabuf ! v4l2h264enc output-io-mode=dmabuf-import` measured 60 fps at 1080p60 on device 105 with about 6% process CPU. ffmpeg 8's `v4l2` input and `*_v4l2m2m` only use MMAP copies, and VIN mappings are uncached; measured about 24.5 fps with about 117% process CPU. VIN measures the input frame rate from frame-done timestamps and reports it through `G_PARM` and `ENUM_FRAMEINTERVALS` (n/1 or n×1000/1001 when close to a standard rate), so ffmpeg and GStreamer get 60 fps and the matching encoder level without being given a frame rate; until the input has been captured once after boot the rate is reported as unknown. The ffmpeg copy path cannot keep up with constant 60 fps output: both the default output and `-r 60` insert duplicate frames and the backlog keeps growing, so add `-fps_mode passthrough`. A capture size larger than the input delivers no frames (DQBUF blocks), and the first stream at the correct size after that may also deliver none; streaming again recovers. Each queue holds at most 16 buffers, all from the default CMA.
 
 These drivers originally lived in `drivers/media/platform/axera/` of `linux-6.18-ax620e`; their commit history moved into this repository along with the directory.
 

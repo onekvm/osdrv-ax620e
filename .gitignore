@@ -8,3 +8,4 @@ modules.order
 local-docs/
 __pycache__/
 tests/venc_rc/test_venc_rc
+tests/vin_fi/test_vin_fi
