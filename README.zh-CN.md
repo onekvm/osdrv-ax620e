@@ -7,7 +7,7 @@ NanoKVM Pro（AX630C）与 NanoKVM Go（AX620Q）的自有视频驱动，作为�
 | 模块 | 源码 | 作用 |
 | --- | --- | --- |
 | `open_vin_csi2.ko` | `kernel/open_vin_csi2.c` | MIPI CSI-2 接收与 D-PHY（V4L2 subdev） |
-| `open_vin_capture.ko` | `kernel/open_vin_capture.c` | VIN/IFE 采集 `/dev/video*`，缓冲可导出 dma-buf；`G_PARM`／`ENUM_FRAMEINTERVALS` 报告实测输入帧率 |
+| `open_vin_capture.ko` | `kernel/open_vin_capture.c` | VIN/IFE 采集 `/dev/video*`，缓冲可导出 dma-buf；lazy-cma 下 MMAP 经缓存；`G_PARM`／`ENUM_FRAMEINTERVALS` 报告实测输入帧率 |
 | `ax630c_venc_vcmd.ko` | `kernel/vc8000e/` | VC8000E 编码命令引擎、帧缓冲分配与 dma-buf 导入 |
 | `ax630c_venc_v4l2.ko` | `kernel/vc8000e/ax630c_venc_v4l2.c` | 可选 V4L2 mem2mem 编码器：YUYV 输入，H.264/H.265 输出，供 GStreamer `v4l2h264enc`/`v4l2h265enc`、ffmpeg `*_v4l2m2m` 使用；单独打包为 `kernel-module-ax630c-venc-v4l2` |
 | `ax630c_tdp.ko` | `kernel/ax630c_tdp.c` | TDP V4L2 mem2mem 缩放与色彩转换 |
@@ -18,7 +18,7 @@ NanoKVM Pro（AX630C）与 NanoKVM Go（AX620Q）的自有视频驱动，作为�
 | `tools/ax630c_npu_dtb.py` | 在 Pro DTB 的 `/soc` 下加入 NPU 节点（`onekvm,ax630c-npu`，寄存器 0x3800000、OCM 0x3000000、PMU 0x2100000，SPI 38/42）；内核 dts 不描述 NPU，由 distro 打包启动 DTB 时调用 |
 | `tools/ax620e_media_dtb.py` | 改写 Pro 内核 DTB：两个私有区替换为共享 lazy-cma 池，或兼容原有的独立 reusable CMA；由 distro 构建启动 DTB 时调用 |
 | `kernel/vc8000e/vcenc/` | V4L2 编码器使用的 VC8000E 寄存器与码流头生成代码，原样取自 onekvm-video-ax630c，来源见 `UPSTREAM.md` |
-| `tests/` | 主机测试：`make -C tests test`（含 DTB 改写、编码器码控与参照实现逐帧对拍、VIN 帧率估计） |
+| `tests/` | 主机测试：`make -C tests test`（含 DTB 改写、编码器码控与参照实现逐帧对拍、VIN 帧率估计、VIN 缓存映射的缓存归属按缓存行模型检查） |
 
 ## 内存
 
@@ -26,19 +26,21 @@ Pro 默认由 VIN 与 VENC 共用 `onekvm-lazy-cma`。采集帧优先从普通�
 
 设备通过 `onekvm,lazy-cma` phandle 选择共享供应者。VIN 的 vb2 缓冲由 dma-buf 持有、映射并原样导出；VENC 仍向用户态返回总线地址，mmap 由 dma-buf 保持页的引用。`vcmd_core.c` 适配映射入口，不修改 `eswin/` 供应商源码。分配 FREE／关闭设备 fd 后，活跃 VMA 继续持有缓冲，最后一个引用关闭才进入保留池。
 
+lazy-cma 设备树下，VIN 把采集缓冲以可缓存方式映射给用户态（模块参数 `cached_mmap`，默认开，修改后对新映射生效）。缓存归属随缓冲移交：QBUF 撤掉用户页表项并回写用户态可能写脏的缓存行；DQBUF 后首次访问先失效整块缓冲再整块映射，每帧一次缺页。不读像素的客户端（如 Core，帧以 dma-buf 交给后级）不产生缺页，也没有缓存操作。计数在 VIN 平台设备的 `cached_mmap_stats`。导出的 dma-buf 和 no-map 预留区布局仍不经缓存。105 上 `memcpy` 一帧 1080p：缓存映射 3.2 ms（含缺页与失效），非缓存 42 ms。
+
 没有此 phandle 时继续兼容原有设备树：
 
 - VIN：`dma_alloc_coherent()` 从设备 CMA 区分配。缓冲数上限按实际占用估算：`no-map` 区每块按 2 的幂取整，CMA 区按 `CONFIG_CMA_ALIGNMENT`（1 MiB）取整，4096×2160 每块 17 MiB，96 MiB 可放 5 块（原按 32 MiB 估只放 3 块）。
 - VC8000E：区域为 `reusable` 时每次 `HANTRO_IOCH_ALLOC_FRAMEBUF` 调用 `dma_alloc_pages()`，释放即归还；仍为 `no-map` 时沿用固定区间内的地址分配。用户态 ABI 不变。
 - `ONEKVM_PRO_MEDIA_REUSABLE=1` 且 `ONEKVM_PRO_LAZY_CMA=0` 时保留两个独立 reusable 池；关闭前者则保留 no-map 布局。Go 沿用原有布局。
 
-`tests/dma-lifetime.c` 是实机测试，经 distro 编译为 `ax620e-dma-lifetime-test` 部署产物；停止视频服务后检查清零、跨所有者映射拒绝，以及 FREE／close／reclaim 期间的活跃映射。主机布局测试继续用 `make -C tests test`。
+`tests/dma-lifetime.c` 是实机测试，经 distro 编译为 `ax620e-dma-lifetime-test` 部署产物；停止视频服务后检查清零、跨所有者映射拒绝，以及 FREE／close／reclaim 期间的活跃映射。`tests/vin-cached-mmap.c`（部署产物 `ax620e-vin-cached-mmap-test`）在 lazy-cma 设备上停止视频服务、有输入信号时运行：只映射不访问没有开销，缓存读与 dma-buf 非缓存视图一致，经映射写入的数据不会进入下一帧，每帧一次缺页、失效和回写。主机布局测试继续用 `make -C tests test`。
 
 ## V4L2 编码器
 
 `ax630c_venc_v4l2` 是 `ax630c_venc_vcmd` 的内核内客户端：VCMD 驱动注册子设备 `ax630c-venc`，编码器在其上建立 `/dev/videoN`，与 Core 的用户态编码会话共享命令调度。OUTPUT 队列支持 MMAP 与 DMABUF 导入，CAPTURE 队列为 MMAP；工作缓冲取自默认 CMA。码控为整数实现（`ax630c_venc_rc.h`），与 onekvm-video-ax630c 的 `vcenc_rc.h` 逐帧一致。统计见 `/sys/bus/platform/devices/ax630c-venc/stats`。
 
-零拷贝用法：`v4l2src io-mode=dmabuf ! v4l2h264enc output-io-mode=dmabuf-import`，105 上 1080p60 实测 60 fps、进程 CPU 约 6%。ffmpeg 8 的 `v4l2` 输入与 `*_v4l2m2m` 只走 MMAP 复制，VIN 映射不经缓存，实测约 24.5 fps、进程 CPU 约 117%。VIN 按帧完成时间戳测量输入帧率，经 `G_PARM` 和 `ENUM_FRAMEINTERVALS` 报告（接近标准帧率时取 n/1 或 n×1000/1001），ffmpeg 与 GStreamer 不指定帧率即可得到 60 fps 和对应的编码级别；开机后还没有采集过时报告未知。ffmpeg 的复制路径跟不上 60 fps 恒定帧率，默认输出和 `-r 60` 都会补帧并越积越多，需加 `-fps_mode passthrough`。采集尺寸大于输入时收不到帧（DQBUF 一直阻塞），之后第一次按正确尺寸开流也可能不出帧，再开一次即恢复。每个队列最多 16 个缓冲，均取自默认 CMA。
+零拷贝用法：`v4l2src io-mode=dmabuf ! v4l2h264enc output-io-mode=dmabuf-import`，105 上 1080p60 实测 60 fps、进程 CPU 约 6%。ffmpeg 8 的 `v4l2` 输入与 `*_v4l2m2m` 只走 MMAP 复制：VIN 映射经缓存（lazy-cma 布局）时 1080p60 达 60 fps、进程 CPU 约 49%，默认输出和 `-r 60` 也一样；no-map 预留区布局下映射不经缓存，约 24.5 fps、进程 CPU 约 117%。VIN 按帧完成时间戳测量输入帧率，经 `G_PARM` 和 `ENUM_FRAMEINTERVALS` 报告（接近标准帧率时取 n/1 或 n×1000/1001），ffmpeg 与 GStreamer 不指定帧率即可得到 60 fps 和对应的编码级别；开机后还没有采集过时报告未知。此时复制路径跟不上 60 fps 恒定帧率，默认输出和 `-r 60` 都会补帧并越积越多，需加 `-fps_mode passthrough`。采集尺寸大于输入时收不到帧（DQBUF 一直阻塞），之后第一次按正确尺寸开流也可能不出帧，再开一次即恢复。每个队列最多 16 个缓冲，均取自默认 CMA。
 
 这些驱动原在 `linux-6.18-ax620e` 的 `drivers/media/platform/axera/`，历史提交已随目录迁入本仓库。
 
