@@ -243,11 +243,17 @@ def memory_regions(root: Node, address_cells: int, size_cells: int) -> list[Regi
     return regions
 
 POOL_COMPATIBLE = "shared-dma-pool"
-# (device compatible, memory-region-names entry or None for the first region)
+# (device compatibles, memory-region-names entry or None for the first region).
+# NanoKVM Go (AX620Q) names its encoder axera,ax620q-vc8000e.
 POOLS = (
-    ("axera,ax630c-vin", None),
-    ("axera,ax630c-vc8000e", "framebuf"),
+    (("axera,ax630c-vin",), None),
+    (("axera,ax630c-vc8000e", "axera,ax620q-vc8000e"), "framebuf"),
 )
+
+
+def enabled_devices(root: Node, compatibles: tuple[str, ...]) -> list[Node]:
+    return [n for n in walk(root) if set(compatibles) & set(n.compatible())
+            and n.prop("status") in (None, b"okay\0", b"ok\0")]
 
 
 def region_node(root: Node, resmem: Node, device: Node, name: str | None) -> Node:
@@ -279,11 +285,11 @@ def lend_pools(fdt: Fdt) -> list[tuple[str, Region]]:
                             cells(root, "#size-cells", 2))
 
     targets = []
-    for compatible, name in POOLS:
-        devices = [n for n in walk(root) if compatible in n.compatible()
-                   and n.prop("status") in (None, b"okay\0", b"ok\0")]
+    for compatibles, name in POOLS:
+        devices = enabled_devices(root, compatibles)
         if len(devices) != 1:
-            raise DtbError(f"expected one enabled {compatible} node, found {len(devices)}")
+            raise DtbError(f"expected one enabled {' or '.join(compatibles)} node, "
+                           f"found {len(devices)}")
         node = region_node(root, resmem, devices[0], name)
         if node.prop("reusable") is not None:
             raise DtbError(f"/reserved-memory/{node.name} is already reusable")
@@ -329,9 +335,7 @@ def lazy_pool(fdt: Fdt, pool_mib: int) -> list[tuple[str, Region]]:
     lent = dict(lend_pools(out))
     root = out.root
     resmem = root.child("reserved-memory")
-    devices = [next(n for n in walk(root) if compat in n.compatible()
-                    and n.prop("status") in (None, b"okay\0", b"ok\0"))
-               for compat, _ in POOLS]
+    devices = [enabled_devices(root, compatibles)[0] for compatibles, _ in POOLS]
     vin, venc = devices
     capture = region_node(root, resmem, vin, None)
     framebuf = region_node(root, resmem, venc, "framebuf")
