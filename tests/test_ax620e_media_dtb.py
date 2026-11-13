@@ -54,6 +54,37 @@ def pro_fdt(framebuf_start=0x73800000, framebuf_mib=96, vin_status=b"okay\0"):
     return Fdt(root, [], 0)
 
 
+def go_fdt():
+    """NanoKVM Go (AX620Q): 32 MiB capture, 88 MiB frame buffer, 8 MiB VCMD."""
+    resmem = Node("reserved-memory", [
+        ("#address-cells", u32(2)), ("#size-cells", u32(2)), ("ranges", b""),
+    ], [
+        Node("capture-pool@48000000", [("compatible", b"shared-dma-pool\0"),
+                                       ("reg", reg64(0x48000000, 32 * MIB)),
+                                       ("no-map", b""), ("phandle", u32(20))]),
+        Node("venc-framebuf@4a000000", [("reg", reg64(0x4A000000, 88 * MIB)),
+                                        ("no-map", b""), ("phandle", u32(21))]),
+        Node("venc-cmdbuf@4f800000", [("compatible", b"shared-dma-pool\0"),
+                                      ("reg", reg64(0x4F800000, 8 * MIB)),
+                                      ("no-map", b""), ("phandle", u32(22))]),
+    ])
+    root = Node("", [("#address-cells", u32(2)), ("#size-cells", u32(2))], [
+        Node("memory@40000000", [("device_type", b"memory\0"),
+                                 ("reg", reg64(0x40000000, 256 * MIB))]),
+        resmem,
+        Node("soc", [], [
+            Node("venc@4010000", [("compatible", b"axera,ax620q-vc8000e\0"),
+                                  ("status", b"okay\0"),
+                                  ("memory-region", u32(22, 21)),
+                                  ("memory-region-names", b"cmdbuf\0framebuf\0")]),
+            Node("video-capture@2400000", [("compatible", b"axera,ax630c-vin\0"),
+                                           ("status", b"okay\0"),
+                                           ("memory-region", u32(20))]),
+        ]),
+    ])
+    return Fdt(root, [], 0)
+
+
 def flags(node):
     return [k for k, _ in node.props if k in ("compatible", "no-map", "reusable")]
 
@@ -81,6 +112,25 @@ class LendPoolsTest(unittest.TestCase):
         self.assertEqual(venc.prop("memory-region"), cmd.prop("phandle"))
         self.assertEqual(venc.prop("memory-region-names"), b"cmdbuf\0")
         self.assertEqual(supplier.prop("memory-region"), pool.prop("phandle"))
+
+    def test_go_ax620q_encoder_lazy_pool(self):
+        fdt = go_fdt()
+        self.assertEqual(tool.lazy_pool(fdt, 64),
+                         [("onekvm-lazy-cma@4a000000", Region(0x4A000000, 0x4E000000))])
+        out = tool.parse(tool.serialize(fdt))
+        resmem = out.root.child("reserved-memory")
+        self.assertEqual([n.name for n in resmem.children],
+                         ["venc-cmdbuf@4f800000", "onekvm-lazy-cma@4a000000"])
+        venc = out.root.child("soc").child("venc@4010000")
+        self.assertEqual(venc.prop("memory-region-names"), b"cmdbuf\0")
+        self.assertEqual(venc.prop("memory-region"), u32(22))
+
+    def test_go_ax620q_encoder_lends_pools(self):
+        fdt = go_fdt()
+        self.assertEqual(tool.lend_pools(fdt), [
+            ("capture-pool@48000000", Region(0x48000000, 0x4A000000)),
+            ("venc-framebuf@4a000000", Region(0x4A000000, 0x4F800000)),
+        ])
 
     def test_lazy_cma_without_cma(self):
         fdt = pro_fdt()

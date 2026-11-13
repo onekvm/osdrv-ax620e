@@ -56,6 +56,7 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/iosys-map.h>
+#include <linux/mm.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/mfd/syscon.h>
@@ -80,6 +81,8 @@
 #include <linux/dma-buf.h>
 #include <linux/scatterlist.h>
 
+#include "ovc_cpu_cache.h"
+#include "ovc_frame_interval.h"
 #include "ovc_golden_4k.h"
 
 #define OVC_DRV_NAME		"open_vin_capture"
@@ -112,6 +115,10 @@ MODULE_PARM_DESC(bypass_clr_mask, "ISP-top module gate CLR strobe (0x02400158); 
 static unsigned int wdma_chn = 8;
 module_param(wdma_chn, uint, 0444);
 MODULE_PARM_DESC(wdma_chn, "IFE-WDMA channel for the packed YUV422 plane");
+
+static bool cached_mmap = true;
+module_param(cached_mmap, bool, 0644);
+MODULE_PARM_DESC(cached_mmap, "Map lazy-cma capture buffers cacheable for CPU readers (applies to new mmaps)");
 
 /* ------------------------------------------------------------------------ */
 /* Register map -- offsets inside the 0x02400000 ISP/VIN register file      */
@@ -347,12 +354,13 @@ struct ovc_dev {
 	bool notifier_registered;
 
 	struct mutex lock;	/* serializes ioctls + queue ops */
-	spinlock_t irqlock;	/* protects buf_list / active / sequence */
+	spinlock_t irqlock;	/* protects buf_list / active / sequence / fi */
 
 	struct vb2_queue queue;
 	struct list_head buf_list;	/* queued, not yet given to hw */
 	struct ovc_buffer *active;	/* buffer the WDMA writes next */
 	unsigned int sequence;
+	struct ovc_fi fi;	/* input frame interval (G_PARM) */
 
 	struct v4l2_pix_format fmt;
 	/* Size of the reserved-memory pool, for the queue_setup buffer cap. */
@@ -418,7 +426,18 @@ struct ovc_mem_buf {
 	refcount_t refcount;
 	struct vb2_vmarea_handler handler;
 	struct ax_lazy_buffer lazy;
+
+	/* Cached user mappings (lazy-cma only, see ovc_mem_mmap_cached). */
+	struct mutex cpu_lock;
+	struct address_space *mapping;	/* the node's, while nvma > 0 */
+	pgoff_t pgoff;			/* private vm_pgoff, see mmap_cached */
+	unsigned int nvma;
+	struct ovc_cc cc;
 };
+
+/* Cached-mapping activity, for the device's cached_mmap_stats. */
+static atomic_long_t ovc_cpu_faults, ovc_cpu_invalidates, ovc_cpu_cleans;
+static atomic_long_t ovc_pgoff_seq;
 
 static void ovc_mem_put(void *buf_priv)
 {
@@ -430,6 +449,7 @@ static void ovc_mem_put(void *buf_priv)
 		else
 			dma_free_coherent(buf->dev, buf->size, buf->vaddr,
 					  buf->dma_addr);
+		mutex_destroy(&buf->cpu_lock);
 		kfree(buf);
 	}
 }
@@ -449,9 +469,11 @@ static void *ovc_mem_alloc(struct vb2_buffer *vb, struct device *dev,
 
 	buf->dev = dev;
 	buf->size = size;
+	mutex_init(&buf->cpu_lock);
 	if (ax_lazy_enabled(dev)) {
 		ret = ax_lazy_alloc(dev, size, &buf->lazy, true);
 		if (ret) {
+			mutex_destroy(&buf->cpu_lock);
 			kfree(buf);
 			return ERR_PTR(ret);
 		}
@@ -464,6 +486,7 @@ static void *ovc_mem_alloc(struct vb2_buffer *vb, struct device *dev,
 	if (!buf->vaddr) {
 		dev_err(dev, "coherent alloc of %lu bytes failed (carveout full?)\n",
 			size);
+		mutex_destroy(&buf->cpu_lock);
 		kfree(buf);
 		return ERR_PTR(-ENOMEM);
 	}
@@ -498,6 +521,143 @@ static unsigned int ovc_mem_num_users(void *buf_priv)
 	return refcount_read(&buf->refcount);
 }
 
+/*
+ * Cached user mappings of lazy-cma buffers.
+ *
+ * Through an uncached mapping every CPU read of a frame is a DDR round
+ * trip, which held ffmpeg's MMAP copy of 1080p60 to ~24 fps. Lazy-cma
+ * pages sit in the kernel linear map, so the node maps them cacheable and
+ * hands cache ownership over with the buffer (ovc_cpu_cache.h). A fault
+ * maps the whole VMA, so a reader takes one fault per frame; Core hands
+ * frames to the encoder and TDP as dma-bufs, never faults and pays one
+ * mutex per QBUF. The declared no-map carveout is outside the linear map
+ * and stays uncached.
+ */
+static void ovc_mem_cache_ops(struct ovc_mem_buf *buf, unsigned int act)
+{
+	if (act & OVC_CC_ZAP)
+		unmap_mapping_range(buf->mapping,
+				    (loff_t)buf->pgoff << PAGE_SHIFT,
+				    PAGE_ALIGN(buf->size), 1);
+	if (act & OVC_CC_CLEAN) {
+		dma_sync_sgtable_for_device(buf->dev, buf->lazy.sgt,
+					    DMA_BIDIRECTIONAL);
+		atomic_long_inc(&ovc_cpu_cleans);
+	}
+	if (act & OVC_CC_INVAL) {
+		dma_sync_sgtable_for_cpu(buf->dev, buf->lazy.sgt,
+					 DMA_BIDIRECTIONAL);
+		atomic_long_inc(&ovc_cpu_invalidates);
+	}
+}
+
+/* QBUF (buf_prepare): the WDMA owns the buffer until DQBUF. */
+static void ovc_mem_qbuf(struct ovc_mem_buf *buf)
+{
+	if (!buf->lazy.dbuf)
+		return;
+	mutex_lock(&buf->cpu_lock);
+	ovc_mem_cache_ops(buf, ovc_cc_qbuf(&buf->cc));
+	mutex_unlock(&buf->cpu_lock);
+}
+
+/* DQBUF (buf_finish), and buffers taken back at STREAMOFF. */
+static void ovc_mem_dqbuf(struct ovc_mem_buf *buf)
+{
+	if (!buf->lazy.dbuf)
+		return;
+	mutex_lock(&buf->cpu_lock);
+	ovc_mem_cache_ops(buf, ovc_cc_dqbuf(&buf->cc));
+	mutex_unlock(&buf->cpu_lock);
+}
+
+static vm_fault_t ovc_mem_vm_fault(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct ovc_mem_buf *buf = vma->vm_private_data;
+	unsigned long pfn = page_to_pfn(sg_page(buf->lazy.sgt->sgl)) +
+			    vma->vm_pgoff - buf->pgoff;
+	unsigned long addr;
+	vm_fault_t ret = VM_FAULT_NOPAGE;
+
+	mutex_lock(&buf->cpu_lock);
+	atomic_long_inc(&ovc_cpu_faults);
+	ovc_mem_cache_ops(buf, ovc_cc_fault(&buf->cc));
+	for (addr = vma->vm_start; addr < vma->vm_end; addr += PAGE_SIZE) {
+		ret = vmf_insert_pfn(vma, addr, pfn++);
+		if (ret & VM_FAULT_ERROR)
+			break;
+	}
+	mutex_unlock(&buf->cpu_lock);
+	return ret & VM_FAULT_ERROR ? ret : VM_FAULT_NOPAGE;
+}
+
+static void ovc_mem_vm_open(struct vm_area_struct *vma)
+{
+	struct ovc_mem_buf *buf = vma->vm_private_data;
+
+	mutex_lock(&buf->cpu_lock);
+	buf->nvma++;
+	mutex_unlock(&buf->cpu_lock);
+	refcount_inc(&buf->refcount);
+}
+
+static void ovc_mem_vm_close(struct vm_area_struct *vma)
+{
+	struct ovc_mem_buf *buf = vma->vm_private_data;
+
+	mutex_lock(&buf->cpu_lock);
+	if (!--buf->nvma) {
+		buf->mapping = NULL;
+		ovc_cc_unmapped(&buf->cc);
+	}
+	mutex_unlock(&buf->cpu_lock);
+	ovc_mem_put(buf);
+}
+
+/* Larger than any capture buffer: per-buffer vm_pgoff ranges never overlap. */
+#define OVC_PGOFF_SHIFT		32
+
+static const struct vm_operations_struct ovc_mem_cached_vm_ops = {
+	.open	= ovc_mem_vm_open,
+	.close	= ovc_mem_vm_close,
+	.fault	= ovc_mem_vm_fault,
+};
+
+/* 0: mapped cached; otherwise the caller maps it uncached. */
+static int ovc_mem_mmap_cached(struct ovc_mem_buf *buf,
+			       struct vm_area_struct *vma)
+{
+	struct address_space *mapping = vma->vm_file->f_mapping;
+
+	if (!READ_ONCE(cached_mmap))
+		return -EINVAL;
+	mutex_lock(&buf->cpu_lock);
+	/* QBUF zaps through one address_space: the first mapper's node. */
+	if (buf->nvma && buf->mapping != mapping) {
+		mutex_unlock(&buf->cpu_lock);
+		return -EBUSY;
+	}
+	/*
+	 * vb2 hands every buffer over at vm_pgoff 0, so all of them would
+	 * share one range of the node's address_space and a QBUF would zap
+	 * every mapped buffer. Give each buffer a range of its own.
+	 */
+	if (!buf->pgoff)
+		buf->pgoff = atomic_long_inc_return(&ovc_pgoff_seq) <<
+			     (OVC_PGOFF_SHIFT - PAGE_SHIFT);
+	vma->vm_pgoff = buf->pgoff;
+	buf->mapping = mapping;
+	buf->nvma++;
+	mutex_unlock(&buf->cpu_lock);
+	refcount_inc(&buf->refcount);
+
+	vm_flags_set(vma, VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
+	vma->vm_private_data = buf;
+	vma->vm_ops = &ovc_mem_cached_vm_ops;
+	return 0;
+}
+
 static int ovc_mem_mmap(void *buf_priv, struct vm_area_struct *vma)
 {
 	struct ovc_mem_buf *buf = buf_priv;
@@ -505,6 +665,8 @@ static int ovc_mem_mmap(void *buf_priv, struct vm_area_struct *vma)
 
 	if (!buf)
 		return -EINVAL;
+	if (buf->lazy.dbuf && !ovc_mem_mmap_cached(buf, vma))
+		return 0;
 
 	/*
 	 * dma_mmap_* use vm_pgoff as an in-buffer offset, but vb2 encodes
@@ -1035,6 +1197,7 @@ static irqreturn_t ovc_isr(int irq, void *priv)
 	 * FSOF (group 1 bit0).
 	 */
 	ovc->sequence++;
+	ovc_fi_sample(&ovc->fi, ktime_get_ns());
 	if (ovc->active && !list_empty(&ovc->buf_list)) {
 		struct ovc_buffer *next;
 
@@ -1161,7 +1324,13 @@ static int ovc_buf_prepare(struct vb2_buffer *vb)
 		return -EINVAL;
 
 	vb2_set_plane_payload(vb, 0, ovc->fmt.sizeimage);
+	ovc_mem_qbuf(vb->planes[0].mem_priv);
 	return 0;
+}
+
+static void ovc_buf_finish(struct vb2_buffer *vb)
+{
+	ovc_mem_dqbuf(vb->planes[0].mem_priv);
 }
 
 static void ovc_buf_queue(struct vb2_buffer *vb)
@@ -1295,6 +1464,7 @@ static int ovc_start_streaming(struct vb2_queue *vq, unsigned int count)
 	 */
 	spin_lock_irqsave(&ovc->irqlock, flags);
 	ovc->sequence = 0;
+	ovc_fi_start(&ovc->fi);
 	ovc->active = list_first_entry(&ovc->buf_list, struct ovc_buffer,
 				       list);
 	list_del(&ovc->active->list);
@@ -1332,6 +1502,7 @@ static void ovc_stop_streaming(struct vb2_queue *vq)
 static const struct vb2_ops ovc_vb2_ops = {
 	.queue_setup		= ovc_queue_setup,
 	.buf_prepare		= ovc_buf_prepare,
+	.buf_finish		= ovc_buf_finish,
 	.buf_queue		= ovc_buf_queue,
 	.start_streaming	= ovc_start_streaming,
 	.stop_streaming		= ovc_stop_streaming,
@@ -1474,6 +1645,61 @@ static int ovc_enum_framesizes(struct file *file, void *priv,
 	return 0;
 }
 
+/*
+ * The source sets the rate: G_PARM reports the measured input interval
+ * (ovc_frame_interval.h) and S_PARM cannot change it. Until the input has
+ * been captured once the interval is unknown, TIMEPERFRAME is not set and
+ * ENUM_FRAMEINTERVALS has nothing to list. Every size has the same interval:
+ * a smaller format crops the input, it does not change its rate.
+ */
+static int ovc_enum_frameintervals(struct file *file, void *priv,
+				   struct v4l2_frmivalenum *fival)
+{
+	struct ovc_dev *ovc = video_drvdata(file);
+	unsigned long flags;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(ovc_pix_formats); i++)
+		if (fival->pixel_format == ovc_pix_formats[i])
+			break;
+	if (fival->index || i == ARRAY_SIZE(ovc_pix_formats) ||
+	    fival->width < OVC_MIN_WIDTH || fival->width > OVC_MAX_WIDTH ||
+	    (fival->width & 1) || fival->height < OVC_MIN_HEIGHT ||
+	    fival->height > OVC_MAX_HEIGHT)
+		return -EINVAL;
+	spin_lock_irqsave(&ovc->irqlock, flags);
+	fival->discrete = ovc->fi.tpf;
+	spin_unlock_irqrestore(&ovc->irqlock, flags);
+	if (!fival->discrete.denominator)
+		return -EINVAL;
+	fival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
+	return 0;
+}
+
+static int ovc_g_parm(struct file *file, void *priv,
+		      struct v4l2_streamparm *a)
+{
+	struct ovc_dev *ovc = video_drvdata(file);
+	struct v4l2_captureparm *cp = &a->parm.capture;
+	unsigned long flags;
+
+	memset(cp, 0, sizeof(*cp));
+	/* vb2 read() allocates min_queued_buffers + 1 */
+	cp->readbuffers = OVC_MIN_BUFFERS;
+	spin_lock_irqsave(&ovc->irqlock, flags);
+	cp->timeperframe = ovc->fi.tpf;
+	spin_unlock_irqrestore(&ovc->irqlock, flags);
+	if (cp->timeperframe.denominator)
+		cp->capability = V4L2_CAP_TIMEPERFRAME;
+	return 0;
+}
+
+static int ovc_s_parm(struct file *file, void *priv,
+		      struct v4l2_streamparm *a)
+{
+	return ovc_g_parm(file, priv, a);
+}
+
 static const struct v4l2_ioctl_ops ovc_ioctl_ops = {
 	.vidioc_querycap		= ovc_querycap,
 	.vidioc_enum_fmt_vid_cap	= ovc_enum_fmt_vid_cap,
@@ -1484,6 +1710,9 @@ static const struct v4l2_ioctl_ops ovc_ioctl_ops = {
 	.vidioc_g_input			= ovc_g_input,
 	.vidioc_s_input			= ovc_s_input,
 	.vidioc_enum_framesizes		= ovc_enum_framesizes,
+	.vidioc_enum_frameintervals	= ovc_enum_frameintervals,
+	.vidioc_g_parm			= ovc_g_parm,
+	.vidioc_s_parm			= ovc_s_parm,
 
 	.vidioc_reqbufs			= vb2_ioctl_reqbufs,
 	.vidioc_create_bufs		= vb2_ioctl_create_bufs,
@@ -1933,6 +2162,22 @@ static const struct of_device_id ovc_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, ovc_of_match);
 
+static ssize_t cached_mmap_stats_show(struct device *dev,
+				      struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "faults %ld\ninvalidates %ld\ncleans %ld\n",
+			  atomic_long_read(&ovc_cpu_faults),
+			  atomic_long_read(&ovc_cpu_invalidates),
+			  atomic_long_read(&ovc_cpu_cleans));
+}
+static DEVICE_ATTR_RO(cached_mmap_stats);
+
+static struct attribute *ovc_attrs[] = {
+	&dev_attr_cached_mmap_stats.attr,
+	NULL
+};
+ATTRIBUTE_GROUPS(ovc);
+
 static struct platform_driver ovc_driver = {
 	.probe	= ovc_probe,
 	.remove	= ovc_remove,
@@ -1940,6 +2185,7 @@ static struct platform_driver ovc_driver = {
 		.name		= OVC_DRV_NAME,
 		.of_match_table	= ovc_of_match,
 		.pm		= pm_ptr(&ovc_pm_ops),
+		.dev_groups	= ovc_groups,
 	},
 };
 module_platform_driver(ovc_driver);
